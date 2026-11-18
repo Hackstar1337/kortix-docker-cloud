@@ -1,0 +1,16 @@
+name: Full source API build
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: python3 scripts/prepare.py --target .work/upstream
+      - run: bash scripts/build.sh .work/upstream kortix-api-docker-cloud:ci
+# Manual-only. A successful build does not certify deployment or cloud parity.

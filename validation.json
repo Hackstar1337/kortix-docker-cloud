@@ -1,0 +1,24 @@
+{
+    "release":  "v0.1.0-rc.1",
+    "status":  "production-candidate-trusted-workload",
+    "overlay_files":  34,
+    "offline_python_tests":  21,
+    "focused_bun_contract_tests":  32,
+    "focused_bun_test_modules":  [
+                                     18,
+                                     4,
+                                     7,
+                                     3
+                                 ],
+    "production_api_typecheck":  "passed against matched isolated dependency image",
+    "github_ci":  "check repository Actions for server-confirmed run",
+    "live_cloud_runtime":  "core pre-hardening runtime previously verified; public-release hardening not separately live-cloud certified",
+    "not_verified":  [
+                         "OpenRouter inference",
+                         "GUI/browser interaction",
+                         "hostile guest security",
+                         "load/soak",
+                         "full-source production image build"
+                     ],
+    "secrets_in_payload":  false
+}

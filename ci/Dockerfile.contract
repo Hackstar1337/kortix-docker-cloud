@@ -1,0 +1,11 @@
+FROM oven/bun:1.4.4
+USER root
+WORKDIR /opt/test-dependencies
+RUN bun add --exact @docker/sandboxes@0.53.0 ws@8.21.0
+WORKDIR /source
+COPY apps/api/src ./apps/api/src
+COPY packages/api-contract/src ./packages/api-contract/src
+COPY packages/sdk/src ./packages/sdk/src
+RUN ln -s /opt/test-dependencies/node_modules ./node_modules
+WORKDIR /source/apps/api
+CMD ["bash", "-lc", "bun test ./src/platform/providers/docker-cloud.test.ts && bun test ./src/platform/providers/docker-cloud-transfer.test.ts && bun test ./src/platform/providers/docker-cloud-ingress.test.ts && bun test ./src/platform/providers/docker-cloud-image-ownership.test.ts"]

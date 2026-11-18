@@ -1,0 +1,16 @@
+.env
+*.env
+!.env.example
+!*.env.example
+*.pem
+*.key
+.work/
+node_modules/
+__pycache__/
+*.pyc
+*.log
+runtime-*-state.json
+runtime-*-result.json
+private-validation*.json
+docker-cloud-backups/
+dist/

@@ -1,0 +1,1815 @@
+diff --git a/apps/api/Dockerfile b/apps/api/Dockerfile
+index c5888a61..90bbeda5 100644
+--- a/apps/api/Dockerfile
++++ b/apps/api/Dockerfile
+@@ -347,6 +347,11 @@ COPY apps/cli/src ./apps/cli/src
+ # Copy the app (source + its node_modules if any)
+ COPY --from=deps /app/${SERVICE} ./${SERVICE}
+ 
++# Cloud ingress is a standalone guest executable; custom App images need no Bun installation.
++RUN bun -e "import { DOCKER_CLOUD_PROXY_SOURCE } from './apps/api/src/platform/providers/docker-cloud-proxy.ts'; await Bun.write('/tmp/docker-cloud-ingress.ts', DOCKER_CLOUD_PROXY_SOURCE)" && \
++    mkdir -p /app/apps/api/dist && \
++    bun build --compile --target=bun-linux-x64 /tmp/docker-cloud-ingress.ts --outfile=/app/apps/api/dist/docker-cloud-ingress
++
+ # Fix agent-tunnel resolution.
+ # pnpm may resolve agent-tunnel to a workspace/file symlink target that does not
+ # exist in the runtime image layout. Replace it with a direct source copy.
+diff --git a/apps/api/package.json b/apps/api/package.json
+index 541ca9a6..3efd9f1e 100644
+--- a/apps/api/package.json
++++ b/apps/api/package.json
+@@ -30,6 +30,7 @@
+     "@composio/client": "0.1.0-alpha.76",
+     "@composio/core": "0.17.0",
+     "@daytonaio/sdk": "^0.184.0",
++    "@docker/sandboxes": "0.53.0",
+     "@hono/zod-openapi": "1.6.2",
+     "@kortix/api-contract": "workspace:*",
+     "@kortix/db": "workspace:*",
+diff --git a/apps/api/src/config.ts b/apps/api/src/config.ts
+index e46d3037..bc0790d6 100644
+--- a/apps/api/src/config.ts
++++ b/apps/api/src/config.ts
+@@ -37,7 +37,7 @@ process.env.GIT_NO_LAZY_FETCH = '1';
+ // removal is scheduled, existing Daytona sessions keep working for now, and it
+ // gets no new features and no support guarantee. E2B support is discontinued;
+ // the DB enum keeps `e2b` only so legacy rows stay readable.
+-export type SandboxProviderName = 'platinum' | 'daytona';
++export type SandboxProviderName = 'platinum' | 'daytona' | 'docker-cloud';
+ type InternalKortixEnv = 'dev' | 'staging' | 'prod' | 'preview';
+ 
+ // ─── Zod Helpers ────────────────────────────────────────────────────────────
+@@ -666,6 +666,13 @@ const envSchema = z.object({
+   // /v1/billing/webhooks/daytona endpoint closes compute billing the instant a
+   // box stops; the reaper sweep is the backstop, so this is optional.
+   DAYTONA_WEBHOOK_SECRET: optStr,
++  DOCKER_CLOUD_USERNAME: optStr,
++  DOCKER_CLOUD_PAT: optStr,
++  DOCKER_CLOUD_IMAGE: optStr,
++  DOCKER_CLOUD_LIFETIME_MINUTES: optInt(60),
++  DOCKER_CLOUD_RENEW_BEFORE_MINUTES: optInt(20),
++  // Empty means use INTERNAL_KORTIX_ENV.
++  DOCKER_CLOUD_ENVIRONMENT: optStr,
+ 
+   // When a template's content hash changes and a fresh snapshot is built, drop
+   // the now-superseded predecessor immediately (reap-on-repoint) instead of
+@@ -872,6 +879,7 @@ const envSchema = z.object({
+   ARTIFACT_CONTENT_URL: optStr,
+   // Comma-separated. The first entry is the default for new sessions.
+   // Platinum is the reference; `daytona` is a legacy opt-in fallback.
++  // Docker Cloud is opt-in and never changes the Platinum default.
+   ALLOWED_SANDBOX_PROVIDERS: optStrDefault('platinum'),
+ 
+   // ── Sandbox lifecycle (Daytona auto-stop / auto-archive / auto-delete) ────
+@@ -1130,7 +1138,7 @@ type EnvIssue = { var: string; message: string; level: 'error' | 'warn' };
+ // ALLOWED_SANDBOX_PROVIDERS — adding a new provider is a one-place change
+ // here plus a case in `getProvider()` in platform/providers/index.ts.
+ // `e2b` is not listed: E2B support is discontinued, so the entry is ignored.
+-export const KNOWN_PROVIDERS: readonly SandboxProviderName[] = ['platinum', 'daytona'] as const;
++export const KNOWN_PROVIDERS: readonly SandboxProviderName[] = ['platinum', 'daytona', 'docker-cloud'] as const;
+ 
+ /**
+  * Parse comma-separated provider list (e.g. "platinum,daytona"). `fallback` is
+@@ -1235,6 +1243,12 @@ function validateEnv(): z.infer<typeof envSchema> {
+         level: providerKeyLevel,
+       });
+   }
++  if (providers.includes('docker-cloud')) {
++    if (!raw.DOCKER_CLOUD_USERNAME)
++      issues.push({ var: 'DOCKER_CLOUD_USERNAME', message: `Required when ALLOWED_SANDBOX_PROVIDERS includes "docker-cloud"${providerKeySuffix}`, level: providerKeyLevel });
++    if (!raw.DOCKER_CLOUD_PAT)
++      issues.push({ var: 'DOCKER_CLOUD_PAT', message: `Required when ALLOWED_SANDBOX_PROVIDERS includes "docker-cloud"${providerKeySuffix}`, level: providerKeyLevel });
++  }
+   if (providers.includes('platinum')) {
+     if (!raw.PLATINUM_API_KEY)
+       issues.push({
+@@ -1626,6 +1640,11 @@ export const config = {
+   DAYTONA_SERVER_URL: env.DAYTONA_SERVER_URL,
+   DAYTONA_TARGET: env.DAYTONA_TARGET,
+   DAYTONA_WEBHOOK_SECRET: env.DAYTONA_WEBHOOK_SECRET,
++  DOCKER_CLOUD_USERNAME: env.DOCKER_CLOUD_USERNAME,
++  DOCKER_CLOUD_PAT: env.DOCKER_CLOUD_PAT,
++  DOCKER_CLOUD_IMAGE: env.DOCKER_CLOUD_IMAGE,
++  DOCKER_CLOUD_LIFETIME_MINUTES: env.DOCKER_CLOUD_LIFETIME_MINUTES,
++  DOCKER_CLOUD_RENEW_BEFORE_MINUTES: env.DOCKER_CLOUD_RENEW_BEFORE_MINUTES,
+   KORTIX_SNAPSHOT_REAP_PREDECESSOR: env.KORTIX_SNAPSHOT_REAP_PREDECESSOR,
+   KORTIX_DRIVES_SESSION_MOUNT: env.KORTIX_DRIVES_SESSION_MOUNT,
+   KORTIX_DRIVES_SYNC: env.KORTIX_DRIVES_SYNC,
+@@ -1693,6 +1712,7 @@ export const config = {
+     env.PLATINUM_TARGET === 'local' ? env.PLATINUM_API_URL_LOCAL : env.PLATINUM_API_URL,
+   PLATINUM_TEMPLATE: env.PLATINUM_TEMPLATE,
+   PLATINUM_WEBHOOK_SECRET: env.PLATINUM_WEBHOOK_SECRET,
++  DOCKER_CLOUD_ENVIRONMENT: env.DOCKER_CLOUD_ENVIRONMENT || env.INTERNAL_KORTIX_ENV,
+   // ─── Sandbox Provisioning (Platform) ──────────────────────────────────────
+   KORTIX_URL: env.KORTIX_URL,
+   ARTIFACT_CONTENT_URL: env.ARTIFACT_CONTENT_URL.replace(/\/+$/, ''),
+@@ -1845,6 +1865,8 @@ export const config = {
+         return !!this.DAYTONA_API_KEY;
+       case 'platinum':
+         return !!this.PLATINUM_API_KEY;
++      case 'docker-cloud':
++        return !!(this.DOCKER_CLOUD_USERNAME && this.DOCKER_CLOUD_PAT);
+       default: {
+         const exhaustive: never = name;
+         return exhaustive;
+diff --git a/apps/api/src/platform/providers/compute-rates.ts b/apps/api/src/platform/providers/compute-rates.ts
+index aa052166..d398ca1e 100644
+--- a/apps/api/src/platform/providers/compute-rates.ts
++++ b/apps/api/src/platform/providers/compute-rates.ts
+@@ -23,6 +23,8 @@ const CUSTOMER_COMPUTE_RATE_CARD: ProviderComputeRateCard = {
+ const PROVIDER_COMPUTE_RATE_CARDS: Record<ProviderName, ProviderComputeRateCard> = {
+   platinum: CUSTOMER_COMPUTE_RATE_CARD,
+   daytona: CUSTOMER_COMPUTE_RATE_CARD,
++  // Kortix customer pricing is provider-neutral. Docker's invoice is a separate vendor cost.
++  'docker-cloud': CUSTOMER_COMPUTE_RATE_CARD,
+ };
+ 
+ /** A legacy `e2b` compute window (E2B support is discontinued) closes at the same rate. */
+diff --git a/apps/api/src/platform/providers/contract.ts b/apps/api/src/platform/providers/contract.ts
+index 7407a115..d8f9731b 100644
+--- a/apps/api/src/platform/providers/contract.ts
++++ b/apps/api/src/platform/providers/contract.ts
+@@ -3,7 +3,7 @@ import { config } from '../../config';
+ // Platinum is the reference provider; Daytona is a legacy fallback (removal
+ // scheduled). E2B support is discontinued: a stored `e2b` row resolves through
+ // tryGetProvider() to null.
+-export type ProviderName = 'platinum' | 'daytona';
++export type ProviderName = 'platinum' | 'daytona' | 'docker-cloud';
+ 
+ export class WarmRuntimeUnavailableError extends Error {
+   constructor(message: string) {
+diff --git a/apps/api/src/platform/providers/docker-cloud-client.ts b/apps/api/src/platform/providers/docker-cloud-client.ts
+new file mode 100644
+index 00000000..49400804
+--- /dev/null
++++ b/apps/api/src/platform/providers/docker-cloud-client.ts
+@@ -0,0 +1,36 @@
++import { Sandboxes, pat } from '@docker/sandboxes';
++import { config } from '../../config';
++
++let client: Sandboxes | undefined;
++
++/** Cloud management credentials never enter a task sandbox or browser. */
++export function getDockerCloudClient(): Sandboxes {
++  if (client) return client;
++  if (!config.DOCKER_CLOUD_USERNAME || !config.DOCKER_CLOUD_PAT) {
++    throw new Error('Docker Cloud requires DOCKER_CLOUD_USERNAME and a Cloud-enabled DOCKER_CLOUD_PAT.');
++  }
++  client = new Sandboxes({
++    auth: pat({ username: config.DOCKER_CLOUD_USERNAME, personalAccessToken: config.DOCKER_CLOUD_PAT }),
++    maxRetries: 2,
++  });
++  return client;
++}
++
++/** Resource names contain slashes; Kortix ingress identifiers must not. */
++export function dockerCloudExternalId(resourceName: string): string {
++  if (!/^sandboxes\/[A-Za-z0-9._-]+$/.test(resourceName)) throw new Error('Invalid Docker Cloud sandbox resource name.');
++  return `dc_${Buffer.from(resourceName, 'utf8').toString('base64url')}`;
++}
++
++export function dockerCloudResourceName(externalId: string): string {
++  if (!/^dc_[A-Za-z0-9_-]+$/.test(externalId) || externalId.length > 255) {
++    throw new Error('Invalid Docker Cloud sandbox identifier.');
++  }
++  const name = Buffer.from(externalId.slice(3), 'base64url').toString('utf8');
++  if (dockerCloudExternalId(name) !== externalId) throw new Error('Invalid Docker Cloud sandbox identifier.');
++  return name;
++}
++
++export function dockerCloudNotFound(error: unknown): boolean {
++  return (error as { httpStatus?: number } | null)?.httpStatus === 404;
++}
+diff --git a/apps/api/src/platform/providers/docker-cloud-image-ownership.test.ts b/apps/api/src/platform/providers/docker-cloud-image-ownership.test.ts
+new file mode 100644
+index 00000000..495d5255
+--- /dev/null
++++ b/apps/api/src/platform/providers/docker-cloud-image-ownership.test.ts
+@@ -0,0 +1,38 @@
++import { expect, mock, test } from 'bun:test';
++import { createHash } from 'node:crypto';
++import { mkdtemp, rm, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++
++mock.module('../sandbox-ownership', () => ({ sandboxOwnershipMarker: async () => 'synthetic-owner' }));
++mock.module('./docker-cloud-client', () => ({ getDockerCloudClient: () => { throw new Error('Synthetic client must be passed explicitly'); } }));
++mock.module('../../snapshots/build-context', () => ({ DEFAULT_CPU: 2, DEFAULT_MEMORY_GB: 4, KORTIX_ENTRYPOINT: '/synthetic-entrypoint', stageRuntimeBuildContext: async () => { throw new Error('unused fixture'); } }));
++mock.module('./docker-cloud-process', () => ({ runDockerCloudCommand: async (_builder: unknown, args: string[]) => ({ exitCode: args.includes('push') ? 1 : 0, stdout: '', stderr: '' }) }));
++mock.module('./docker-cloud-transfer', () => ({ uploadDockerCloudFile: async () => ({ bytes: 1, sha256: 'synthetic' }) }));
++const { findDockerCloudImages, importDockerCloudStagedContext } = await import('../../snapshots/providers/docker-cloud-builder');
++const prefix = `kortix-${createHash('sha256').update('synthetic-owner').digest('hex').slice(0,16)}-`;
++
++test('direct foreign image resource is refused despite a valid images/ identifier', async () => {
++  const client: any = { images: { get: async () => ({ name: 'images/synthetic', displayName: 'another-deployment-image' }) } };
++  await expect(findDockerCloudImages('images/synthetic', client)).rejects.toThrow('not owned');
++});
++
++test('direct owned image resource is resolved exactly', async () => {
++  const image = { name: 'images/synthetic', displayName: prefix+'synthetic-snapshot' };
++  const client: any = { images: { get: async () => image } };
++  expect(await findDockerCloudImages(image.name,client)).toEqual([image]);
++});
++
++test('failed private registry push independently scrubs credentials before builder deletion', async () => {
++  const dir = await mkdtemp(join(tmpdir(),'kortix-image-cleanup-fixture-'));
++  const operations: string[] = [];
++  try {
++    await writeFile(join(dir,'Dockerfile'),'FROM scratch\n');
++    const builder: any = { name: 'sandboxes/synthetic-builder', files: { write: async () => ({}) }, processes: { run: async (input: any) => { operations.push(input.args.join(' ')); return {exitCode:0}; } }, delete: async () => { operations.push('delete');return {waitUntilDeleted:async()=>undefined}; } };
++    const image: any = {name:'images/synthetic-image',status:'waitingForPush',pushTarget:{imageRef:'registry.example.invalid/synthetic-namespace/image:synthetic',accessToken:'synthetic-upload-token'},delete:async()=>undefined};
++    const client: any = { kits:{launchAndWait:async()=>builder},get:async()=>builder,images:{create:async()=>image,get:async()=>image} };
++    await expect(importDockerCloudStagedContext({contextDir:dir,dockerfileName:'Dockerfile'} as any,{snapshotName:'synthetic',spec:{cpu:2,memoryGb:4},runtimeProfile:'standard'} as any,undefined,client)).rejects.toThrow('failed with exit code');
++    expect(operations).toContain('rm -rf /tmp/kortix-upload');
++    expect(operations.indexOf('rm -rf /tmp/kortix-upload')).toBeLessThan(operations.indexOf('delete'));
++  } finally {await rm(dir,{recursive:true,force:true});}
++});
+diff --git a/apps/api/src/platform/providers/docker-cloud-ingress.test.ts b/apps/api/src/platform/providers/docker-cloud-ingress.test.ts
+new file mode 100644
+index 00000000..c96910ba
+--- /dev/null
++++ b/apps/api/src/platform/providers/docker-cloud-ingress.test.ts
+@@ -0,0 +1,87 @@
++import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
++import { mkdtemp, mkdir, rm } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import NodeWebSocket from 'ws';
++import { DOCKER_CLOUD_PROXY_SOURCE } from './docker-cloud-proxy';
++
++const token = 'synthetic-private-ingress-token';
++const headers = { 'x-kortix-docker-cloud-token': token, 'x-kortix-docker-cloud-port': '19081', Authorization: 'Bearer synthetic-runtime-token' };
++let dir: string;
++let processHandle: ReturnType<typeof Bun.spawn>;
++let upstream: ReturnType<typeof Bun.serve>;
++
++beforeAll(async () => {
++  dir = await mkdtemp(join(tmpdir(), 'kortix-dc-ingress-test-'));
++  await mkdir('/tmp/kortix-docker-cloud', { recursive: true, mode: 0o700 });
++  await Bun.write('/tmp/kortix-docker-cloud/ingress-key', token);
++  upstream = Bun.serve({
++    port: 19081, hostname: '127.0.0.1',
++    async fetch(request, server) {
++      const path = new URL(request.url).pathname;
++      if (path === '/ws') { if (server.upgrade(request, { data: undefined })) return; return new Response('upgrade failed', { status: 400 }); }
++      if (path === '/stream') return new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('event: proof\ndata: stream-proof\n\n')); controller.close(); } }), { headers: { 'content-type': 'text/event-stream' } });
++      if (path === '/post') return new Response(await request.text());
++      return Response.json({ path, auth: request.headers.get('authorization'), tokenLeaked: request.headers.has('x-kortix-docker-cloud-token'), portLeaked: request.headers.has('x-kortix-docker-cloud-port') });
++    },
++    websocket: { message(socket, message) { socket.send(message); } },
++  });
++  const script = join(dir, 'proxy.ts');
++  await Bun.write(script, DOCKER_CLOUD_PROXY_SOURCE);
++  processHandle = Bun.spawn([process.execPath, script], { stdout: 'ignore', stderr: 'pipe' });
++  const probe = Bun.spawn([process.execPath, script, '--probe'], { stdout: 'ignore', stderr: 'ignore' });
++  expect(await probe.exited).toBe(0);
++});
++
++afterAll(async () => {
++  processHandle?.kill(); if (processHandle) await processHandle.exited;
++  upstream?.stop(true); if (dir) await rm(dir, { recursive: true, force: true });
++  await rm('/tmp/kortix-docker-cloud', { recursive: true, force: true });
++});
++
++describe('Docker Cloud private ingress', () => {
++  test('public URL and query parameters grant no access', async () => {
++    const response = await fetch('http://127.0.0.1:18080/?x-kortix-docker-cloud-token=' + token);
++    expect(response.status).toBe(401);
++  });
++  test('tampered header is refused before contacting the application', async () => {
++    const response = await fetch('http://127.0.0.1:18080/', { headers: { ...headers, 'x-kortix-docker-cloud-token': token + 'tampered' } });
++    expect(response.status).toBe(401);
++  });
++  test('authenticated HTTP preserves runtime auth but never forwards edge credentials', async () => {
++    const response = await fetch('http://127.0.0.1:18080/proof', { headers });
++    expect(response.status).toBe(200);
++    expect(await response.json()).toEqual({ path: '/proof', auth: 'Bearer synthetic-runtime-token', tokenLeaked: false, portLeaked: false });
++  });
++  test('request body and SSE stream survive the reverse proxy', async () => {
++    const body = 'body-proof'.repeat(10000);
++    const posted = await fetch('http://127.0.0.1:18080/post', { method: 'POST', headers, body });
++    expect(await posted.text()).toBe(body);
++    const stream = await fetch('http://127.0.0.1:18080/stream', { headers });
++    expect(stream.headers.get('content-type')).toBe('text/event-stream'); expect(await stream.text()).toContain('stream-proof');
++  });
++  test('port recursion and out-of-range targets are rejected', async () => {
++    for (const port of ['18080', '0', '65536', 'invalid']) {
++      const response = await fetch('http://127.0.0.1:18080/', { headers: { ...headers, 'x-kortix-docker-cloud-port': port } }); expect(response.status).toBe(400);
++    }
++  });
++  test('WebSocket terminal/desktop transport relays text and binary frames', async () => {
++    const received = await new Promise<Array<string | Uint8Array>>((resolve, reject) => {
++      const socket = new NodeWebSocket('ws://127.0.0.1:18080/ws', { headers }); socket.binaryType = 'arraybuffer';
++      const result: Array<string | Uint8Array> = [];
++      const timeout = setTimeout(() => { socket.close(); reject(new Error('WebSocket relay timed out')); }, 5000);
++      socket.addEventListener('open', () => { socket.send('terminal-proof'); socket.send(new Uint8Array([1, 2, 3, 255])); });
++      socket.addEventListener('message', (event) => {
++        result.push(typeof event.data === 'string' ? event.data : new Uint8Array(event.data as ArrayBuffer));
++        if (result.length === 2) { clearTimeout(timeout); socket.close(); resolve(result); }
++      });
++      socket.addEventListener('error', () => { clearTimeout(timeout); reject(new Error('WebSocket relay failed')); });
++    });
++    expect(received[0]).toBe('terminal-proof'); expect(received[1]).toEqual(new Uint8Array([1, 2, 3, 255]));
++  });
++  test('backend key rotation updates ingress without restarting the guest', async () => {
++    await Bun.write('/tmp/kortix-docker-cloud/ingress-key', 'rotated-synthetic-key');
++    const old = await fetch('http://127.0.0.1:18080/', { headers }); expect(old.status).toBe(401);
++    const fresh = await fetch('http://127.0.0.1:18080/', { headers: { ...headers, 'x-kortix-docker-cloud-token': 'rotated-synthetic-key' } }); expect(fresh.status).toBe(200);
++  });
++});
+diff --git a/apps/api/src/platform/providers/docker-cloud-process.ts b/apps/api/src/platform/providers/docker-cloud-process.ts
+new file mode 100644
+index 00000000..16233497
+--- /dev/null
++++ b/apps/api/src/platform/providers/docker-cloud-process.ts
+@@ -0,0 +1,45 @@
++import { randomUUID } from 'node:crypto';
++import type { Sandbox } from '@docker/sandboxes';
++
++export async function runDockerCloudCommand(
++  sandbox: Sandbox,
++  args: string[],
++  options: { timeoutMs: number; signal?: AbortSignal; onProgress?: (step: number | null) => void },
++): Promise<{ exitCode: number; stdout: string; stderr: string }> {
++  const deadline = Date.now() + options.timeoutMs;
++  const signal = AbortSignal.any([AbortSignal.timeout(options.timeoutMs), ...(options.signal ? [options.signal] : [])]);
++  const identity = `kortix-image-command-${randomUUID()}`;
++  let process = await sandbox.processes.start({ args, user: 'root', label: identity, session: identity }, { timeoutMs: Math.min(30_000, options.timeoutMs), signal, idempotencyKey: identity });
++  let cursor: number | string = 0;
++  let stdout = '';
++  let stderr = '';
++  let lastProgress = 0;
++  let step: number | null = null;
++  try {
++    while (Date.now() < deadline) {
++      signal.throwIfAborted();
++      try {
++        const page = await process.readOutput({ resumeFrom: cursor, maxBytes: 64 * 1024 }, { timeoutMs: Math.min(15_000, deadline - Date.now()), signal });
++        cursor = page.nextResumeFrom ?? cursor;
++        for (const chunk of page.chunks ?? []) {
++          const text = Buffer.from(chunk.data ?? new Uint8Array()).toString('utf8');
++          if (chunk.stream === 'stderr') stderr = (stderr + text).slice(-256 * 1024);
++          else stdout = (stdout + text).slice(-256 * 1024);
++          for (const match of text.matchAll(/(?:^|\n)#(\d+)\s/g)) step = Number(match[1]);
++        }
++        if (page.exited?.exitCode != null) return { exitCode: page.exited.exitCode, stdout, stderr };
++      } catch (error) {
++        if (signal.aborted) throw error;
++        // Output-channel availability is not process status. Reconcile via the control plane below.
++      }
++      process = await process.refresh({ timeoutMs: Math.min(15_000, deadline - Date.now()), signal });
++      if (process.state === 'exited' && process.exitCode != null) return { exitCode: process.exitCode, stdout, stderr };
++      if (Date.now() - lastProgress >= 30_000) { options.onProgress?.(step); lastProgress = Date.now(); }
++      await new Promise((resolve) => setTimeout(resolve, Math.min(2_000, Math.max(1, deadline - Date.now()))));
++    }
++    throw new Error('Docker Cloud image command exceeded its authorized execution budget.');
++  } catch (error) {
++    try { await process.signal('term', { timeoutMs: 15_000 }); } catch { /* The owning builder cleanup/timeout is the final backstop. */ }
++    throw error;
++  }
++}
+diff --git a/apps/api/src/platform/providers/docker-cloud-proxy.ts b/apps/api/src/platform/providers/docker-cloud-proxy.ts
+new file mode 100644
+index 00000000..89e9f39e
+--- /dev/null
++++ b/apps/api/src/platform/providers/docker-cloud-proxy.ts
+@@ -0,0 +1,72 @@
++/** Only this authenticated ingress port is published to Docker's edge. */
++export const DOCKER_CLOUD_INGRESS_PORT = 18080;
++export const DOCKER_CLOUD_INGRESS_TOKEN_HEADER = 'x-kortix-docker-cloud-token';
++export const DOCKER_CLOUD_TARGET_PORT_HEADER = 'x-kortix-docker-cloud-port';
++
++/** Standalone Bun program: no npm packages or management credentials in the guest. */
++export const DOCKER_CLOUD_PROXY_SOURCE = String.raw`
++import { timingSafeEqual } from 'node:crypto';
++if (process.argv.includes('--probe')) {
++  for (let attempt=0;attempt<10;attempt++) {
++    try { const response=await fetch('http://127.0.0.1:18080',{signal:AbortSignal.timeout(1000)});if(response.status===401)process.exit(0); } catch {}
++    await Bun.sleep(100);
++  }
++  process.exit(1);
++}
++const tokenHeader = 'x-kortix-docker-cloud-token';
++const portHeader = 'x-kortix-docker-cloud-port';
++const hop = ['connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade'];
++async function authenticated(value) {
++  const key = (await Bun.file('/tmp/kortix-docker-cloud/ingress-key').text().catch(()=> '')).trim();
++  if (!key) return false;
++  const a = Buffer.from(value ?? ''); const b = Buffer.from(key);
++  return a.length === b.length && timingSafeEqual(a,b);
++}
++function outgoingHeaders(request) {
++  const headers = new Headers(request.headers);
++  for (const name of [...hop,tokenHeader,portHeader,'host']) headers.delete(name);
++  return headers;
++}
++Bun.serve({
++  hostname:'0.0.0.0', port:18080, maxRequestBodySize:64*1024*1024, idleTimeout:120,
++  async fetch(request, server) {
++    if (!await authenticated(request.headers.get(tokenHeader))) return new Response('Unauthorized',{status:401});
++    const value=request.headers.get(portHeader) ?? '';
++    if(!/^\d{1,5}$/.test(value)) return new Response('Invalid target port',{status:400});
++    const port=Number(value);
++    if(port<1 || port>65535 || port===18080) return new Response('Invalid target port',{status:400});
++    const target=new URL(request.url); target.hostname='127.0.0.1';target.port=String(port);target.protocol='http:';
++    const headers=outgoingHeaders(request);
++    if(request.headers.get('upgrade')?.toLowerCase()==='websocket') {
++      target.protocol='ws:';
++      for(const name of ['sec-websocket-key','sec-websocket-version','sec-websocket-extensions','sec-websocket-protocol']) headers.delete(name);
++      const protocols=request.headers.get('sec-websocket-protocol')?.split(',').map(x=>x.trim()).filter(Boolean);
++      if(server.upgrade(request,{data:{target:target.toString(),headers:Object.fromEntries(headers),protocols,queue:[],queuedBytes:0,upstream:null}}))return;
++      return new Response('WebSocket upgrade failed',{status:400});
++    }
++    try {
++      const response=await fetch(target,{method:request.method,headers,body:request.method==='GET'||request.method==='HEAD'?undefined:request.body,redirect:'manual',signal:request.signal});
++      const output=new Headers(response.headers);for(const name of hop)output.delete(name);
++      return new Response(response.body,{status:response.status,statusText:response.statusText,headers:output});
++    } catch { return new Response('Sandbox application unavailable',{status:502}); }
++  },
++  websocket:{
++    maxPayloadLength:16*1024*1024, idleTimeout:120,
++    open(socket) {
++      const data=socket.data;
++      const upstream=new WebSocket(data.target,{headers:data.headers,protocols:data.protocols});data.upstream=upstream;
++      upstream.binaryType='arraybuffer';
++      upstream.addEventListener('open',()=>{for(const message of data.queue)upstream.send(message);data.queue=[];data.queuedBytes=0;});
++      upstream.addEventListener('message',event=>{if(typeof event.data==='string')socket.send(event.data);else socket.send(new Uint8Array(event.data));});
++      upstream.addEventListener('close',()=>socket.close(1000));
++      upstream.addEventListener('error',()=>socket.close(1011));
++    },
++    message(socket,message) {
++      const data=socket.data;
++      if(data.upstream?.readyState===WebSocket.OPEN)data.upstream.send(message);
++      else {data.queuedBytes+=typeof message==='string'?Buffer.byteLength(message):message.byteLength;if(data.queuedBytes>1024*1024){socket.close(1009);return;}data.queue.push(message);}
++    },
++    close(socket){try{socket.data.upstream?.close();}catch{}},
++  },
++});
++`;
+diff --git a/apps/api/src/platform/providers/docker-cloud-transfer.test.ts b/apps/api/src/platform/providers/docker-cloud-transfer.test.ts
+new file mode 100644
+index 00000000..45b01085
+--- /dev/null
++++ b/apps/api/src/platform/providers/docker-cloud-transfer.test.ts
+@@ -0,0 +1,49 @@
++import { describe, expect, test } from 'bun:test';
++import { createHash } from 'node:crypto';
++import type { Sandbox } from '@docker/sandboxes';
++import { uploadDockerCloudFile } from './docker-cloud-transfer';
++
++function fixture(options: { failWrite?: boolean; corruptDigest?: boolean } = {}) {
++  const files = new Map<string, Uint8Array>();
++  const calls: string[][] = [];
++  let maximumWrite = 0;
++  let assembled: Buffer | undefined;
++  const sandbox = {
++    files: { write: async (path: string, content: Uint8Array) => {
++      maximumWrite = Math.max(maximumWrite, content.byteLength);
++      if (options.failWrite && path.endsWith('00000001')) throw new Error('synthetic transfer interruption');
++      files.set(path, new Uint8Array(content)); return {};
++    } },
++    processes: { run: async ({ args }: { args: string[] }) => {
++      calls.push(args);
++      if (args[0] === '/bin/sh') {
++        const prefix = args[4] + '/part-';
++        assembled = Buffer.concat([...files].filter(([path]) => path.startsWith(prefix)).sort(([a], [b]) => a.localeCompare(b)).map(([, content]) => Buffer.from(content)));
++        const digest = options.corruptDigest ? '0'.repeat(64) : createHash('sha256').update(assembled).digest('hex');
++        return { exitCode: 0, stdout: `${digest}  ${args[5]}\n`, stderr: '', incomplete: false };
++      }
++      return { exitCode: 0, stdout: '', stderr: '', incomplete: false };
++    } },
++  } as unknown as Sandbox;
++  return { sandbox, files, calls, maximumWrite: () => maximumWrite, assembled: () => assembled };
++}
++
++describe('Docker Cloud artifact transfer', () => {
++  test('large artifacts preserve bytes and never exceed the per-request chunk ceiling', async () => {
++    const data = new Uint8Array(2 * 1024 * 1024 + 123); for (let i = 0; i < data.length; i++) data[i] = i % 251;
++    const f = fixture(); const result = await uploadDockerCloudFile(f.sandbox, '/tmp/artifact', data);
++    expect(result.bytes).toBe(data.length); expect(f.maximumWrite()).toBeLessThanOrEqual(1024 * 1024);
++    expect(f.assembled()).toEqual(Buffer.from(data)); expect(result.sha256).toBe(createHash('sha256').update(data).digest('hex'));
++    expect(f.calls.at(-1)?.slice(0, 2)).toEqual(['rm', '-rf']);
++  });
++  test('a rejected write stops assembly and still cleans temporary parts', async () => {
++    const f = fixture({ failWrite: true }); await expect(uploadDockerCloudFile(f.sandbox, '/tmp/artifact', new Uint8Array(4 * 1024 * 1024))).rejects.toThrow('synthetic transfer interruption');
++    expect(f.assembled()).toBeUndefined(); expect(f.calls.at(-1)?.slice(0, 2)).toEqual(['rm', '-rf']);
++  });
++  test('checksum mismatch is rejected rather than running a corrupted executable', async () => {
++    const f = fixture({ corruptDigest: true }); await expect(uploadDockerCloudFile(f.sandbox, '/tmp/artifact', new Uint8Array([1, 2, 3]))).rejects.toThrow('checksum mismatch');
++  });
++  test('a relative destination is rejected before creating guest files', async () => {
++    const f = fixture(); await expect(uploadDockerCloudFile(f.sandbox, '../artifact', new Uint8Array([1]))).rejects.toThrow('absolute guest path'); expect(f.calls).toEqual([]);
++  });
++});
+diff --git a/apps/api/src/platform/providers/docker-cloud-transfer.ts b/apps/api/src/platform/providers/docker-cloud-transfer.ts
+new file mode 100644
+index 00000000..cd53c183
+--- /dev/null
++++ b/apps/api/src/platform/providers/docker-cloud-transfer.ts
+@@ -0,0 +1,62 @@
++import { createHash, randomUUID } from 'node:crypto';
++import type { Sandbox } from '@docker/sandboxes';
++
++const PART_BYTES = 1024 * 1024;
++const MAX_BYTES = 512 * 1024 * 1024;
++
++/** Small independent file writes avoid the Cloud API's single-request body limit. */
++export async function uploadDockerCloudFile(
++  sandbox: Sandbox,
++  target: string,
++  source: Uint8Array | AsyncIterable<Uint8Array>,
++  options: { signal?: AbortSignal; timeoutMs?: number; executable?: boolean } = {},
++): Promise<{ bytes: number; sha256: string }> {
++  if (!target.startsWith('/') || target.includes('\0')) throw new Error('Docker Cloud transfer requires an absolute guest path.');
++  const partDir = `/tmp/kortix-transfer-${randomUUID()}`;
++  const signal = AbortSignal.any([AbortSignal.timeout(options.timeoutMs ?? 300_000), ...(options.signal ? [options.signal] : [])]);
++  const command = async (args: string[]) => {
++    const result = await sandbox.processes.run({ args, user: 'root' }, { timeoutMs: 60_000, signal });
++    if (result.exitCode !== 0 || result.incomplete) throw new Error('Docker Cloud artifact-transfer command failed.');
++    return result.stdout;
++  };
++  const hash = createHash('sha256');
++  let bytes = 0;
++  let index = 0;
++  const pending = new Set<Promise<void>>();
++  let failure: unknown;
++  async function* parts() {
++    const iterator = source instanceof Uint8Array ? [source] : source;
++    for await (const chunk of iterator) {
++      for (let offset = 0; offset < chunk.byteLength; offset += PART_BYTES) yield chunk.subarray(offset, offset + PART_BYTES);
++    }
++  }
++  try {
++    await command(['mkdir', '-p', partDir]);
++    await command(['chmod', '700', partDir]);
++    for await (const part of parts()) {
++      signal.throwIfAborted();
++      if (failure) throw failure;
++      bytes += part.byteLength;
++      if (bytes > MAX_BYTES) throw new Error('Docker Cloud artifact exceeds the 512 MiB transfer ceiling.');
++      hash.update(part);
++      const path = `${partDir}/part-${String(index++).padStart(8, '0')}`;
++      let write: Promise<void>;
++      write = sandbox.files.write(path, part, { mode: 0o600 }, { timeoutMs: 30_000, signal }).then(() => undefined, (error) => { failure ??= error; }).finally(() => { pending.delete(write); });
++      pending.add(write);
++      if (pending.size >= 3) await Promise.race(pending);
++    }
++    await Promise.all(pending);
++    if (failure) throw failure;
++    if (!index) await sandbox.files.write(`${partDir}/part-00000000`, new Uint8Array(), { mode: 0o600 }, { timeoutMs: 30_000, signal });
++    const expected = hash.digest('hex');
++    const mode = options.executable ? '700' : '600';
++    const output = await command(['/bin/sh', '-c', 'set -e; cat "$1"/part-* > "$2"; chmod "$3" "$2"; sha256sum "$2"', 'transfer', partDir, target, mode]);
++    const actual = output.trim().split(/\s+/)[0];
++    if (actual !== expected) throw new Error('Docker Cloud artifact checksum mismatch; refusing to use incomplete bytes.');
++    return { bytes, sha256: expected };
++  } finally {
++    await Promise.allSettled(pending);
++    // Cleanup gets its own bounded budget, even when the transfer signal was cancelled.
++    try { await sandbox.processes.run({ args: ['rm', '-rf', partDir], user: 'root' }, { timeoutMs: 30_000 }); } catch { /* Sandbox cleanup or provider timeout removes the temp directory. */ }
++  }
++}
+diff --git a/apps/api/src/platform/providers/docker-cloud.test.ts b/apps/api/src/platform/providers/docker-cloud.test.ts
+new file mode 100644
+index 00000000..5bdc8cb4
+--- /dev/null
++++ b/apps/api/src/platform/providers/docker-cloud.test.ts
+@@ -0,0 +1,157 @@
++import { describe, expect, test, mock } from 'bun:test';
++import type { Sandboxes } from '@docker/sandboxes';
++
++mock.module('../../config', () => ({ config: { DOCKER_CLOUD_USERNAME: 'synthetic-user', DOCKER_CLOUD_PAT: 'synthetic-management-token', DOCKER_CLOUD_LIFETIME_MINUTES: 60, DOCKER_CLOUD_RENEW_BEFORE_MINUTES: 20, INTERNAL_SERVICE_KEY: 'synthetic-signing-key' } }));
++mock.module('../sandbox-ownership', () => ({ sandboxOwnershipMarker: async () => 'synthetic-owner' }));
++mock.module('../service-key', () => ({ serviceKeyForExternalId: async () => 'synthetic-runtime-token' }));
++mock.module('../../snapshots/providers/docker-cloud-builder', () => ({ findDockerCloudImages: async () => [{ name: 'images/synthetic-image', status: 'completed', createdAt: new Date(0), resources: { cpus: 2, memoryMib: 4096 } }] }));
++
++const { DockerCloudProvider, dockerCloudStatus, dockerCloudRenewalDue } = await import('./docker-cloud');
++const { dockerCloudExternalId, dockerCloudResourceName } = await import('./docker-cloud-client');
++const now = Date.parse('2026-01-01T00:00:00Z');
++const externalId = dockerCloudExternalId('sandboxes/synthetic-sandbox');
++
++function fixture(status = 'running', expires = now + 10 * 60_000) {
++  const calls: Array<{ operation: string; input?: unknown; options?: unknown }> = [];
++  const box: any = {
++    name: 'sandboxes/synthetic-sandbox', uid: 'synthetic-sandbox', etag: 'synthetic-etag', status,
++    core: { labels: { 'kortix.managed': 'synthetic-owner', 'kortix.logical_id': 'synthetic-logical' }, createdAt: new Date(now), resources: { cpus: 2, memoryMib: 4096 } },
++    effectiveFeatures: { timeouts: { expiresAt: new Date(expires), onTimeout: 'stop', autoResume: false }, managedVolumes: { attachments: [{ volume: 'volumes/synthetic-volume', target: '/workspace' }] } },
++    processes: { run: async () => ({ exitCode: 0, stdout: '', stderr: '', incomplete: false }), all: () => ({ collect: async () => [{ session: 'kortix-docker-cloud-ingress-v1', state: 'running' }] }) },
++    files: { write: async () => ({}) },
++    ports: { list: async () => ({ published: [{ number: 18080, url: 'https://synthetic.example.invalid' }] }) },
++    waitUntilRunning: async () => box,
++    waitUntilStopped: async () => box,
++    waitUntilDeleted: async () => undefined,
++    renewTimeout: async (input: unknown) => { calls.push({ operation: 'renew', input }); box.effectiveFeatures.timeouts.expiresAt = new Date(now + 60 * 60_000); return box; },
++    start: async () => { calls.push({ operation: 'start' }); box.status = 'running'; return box; },
++    stop: async () => { calls.push({ operation: 'stop' }); box.status = 'stopped'; return box; },
++    delete: async () => { calls.push({ operation: 'delete' }); return undefined; },
++  };
++  const client: any = {
++    get: async () => box,
++    all: async function* () { yield box; yield { ...box, name: 'sandboxes/not-owned', core: { ...box.core, labels: { 'kortix.managed': 'another-owner' } } }; },
++    create: async (input: any, options: unknown) => { calls.push({ operation: 'create', input, options }); box.core.labels = input.labels; return box; },
++    volumes: { create: async (input: unknown, options: unknown) => { calls.push({ operation: 'volume', input, options }); return { name: 'volumes/synthetic-volume' }; }, delete: async () => { throw new Error('User volume deletion is forbidden'); } },
++  };
++  const provider = new DockerCloudProvider({ client: client as Sandboxes, owner: async () => 'synthetic-owner', signingKey: () => 'synthetic-signing-key', serviceKey: async () => 'synthetic-runtime-token', now: () => now });
++  return { provider, client, box, calls };
++}
++
++describe('Docker Cloud provider contract', () => {
++  test('resource names round-trip without slashes in Kortix external identifiers', () => {
++    expect(externalId).not.toContain('/'); expect(dockerCloudResourceName(externalId)).toBe('sandboxes/synthetic-sandbox');
++    expect(() => dockerCloudResourceName('dc_Li4vLi4vc2VjcmV0')).toThrow();
++  });
++  test('uncertain and transitional states never become terminal', () => {
++    expect(dockerCloudStatus('failed')).toBe('terminal'); expect(dockerCloudStatus('degraded')).toBe('unknown'); expect(dockerCloudStatus('stopping')).toBe('unknown');
++  });
++  test('renewal applies only to a confirmed running sandbox near expiry', async () => {
++    const f = fixture(); await f.provider.renewLifecycle(externalId); expect(f.calls.map((c) => c.operation)).toEqual(['renew']);
++    expect(f.calls[0].input).toEqual({ timeoutMs: 3_600_000 });
++    expect(dockerCloudRenewalDue('stopped', undefined, now, 1_200_000)).toBe(false);
++    expect(dockerCloudRenewalDue('running', new Date(now + 1_800_000), now, 1_200_000)).toBe(false);
++    expect(() => dockerCloudRenewalDue('running', undefined, now, 1_200_000)).toThrow();
++  });
++  test('renewal must not wake a stopped sandbox', async () => {
++    const f = fixture('stopped'); await f.provider.renewLifecycle(externalId); expect(f.calls).toEqual([]);
++  });
++  test('stopping is idempotent and removal never deletes independent storage', async () => {
++    const f = fixture('stopped'); await f.provider.stop(externalId); expect(f.calls).toEqual([]); await f.provider.remove(externalId); expect(f.calls.map((c) => c.operation)).toEqual(['delete']);
++  });
++  test('ownership mismatch fails closed and excludes other deployments from orphan cleanup', async () => {
++    const f = fixture(); const managed = await f.provider.listManagedRunningSandboxes(); expect(managed).toHaveLength(1);
++    f.box.core.labels['kortix.managed'] = 'another-owner'; expect(await f.provider.getStatus(externalId)).toBe('unknown'); expect(f.provider.stop(externalId)).rejects.toThrow('does not belong');
++  });
++  test('404 means removed but a 503 is unknown, not data loss', async () => {
++    const f = fixture(); f.client.get = async () => { throw { httpStatus: 404 }; }; expect(await f.provider.getStatus(externalId)).toBe('removed');
++    f.client.get = async () => { throw { httpStatus: 503 }; }; expect(await f.provider.getStatus(externalId)).toBe('unknown');
++  });
++  test('create is idempotent, mounts persistent workspace and disables automatic resume', async () => {
++    const f = fixture(); const opts = { accountId: 'synthetic-account', userId: 'synthetic-user', name: 'synthetic-name', sandboxId: 'synthetic-logical', snapshot: 'synthetic-snapshot', envVars: { KORTIX_TOKEN: 'synthetic-runtime-token' }, createAttempt: 3 };
++    const result = await f.provider.create(opts); await f.provider.create(opts);
++    const creates = f.calls.filter((c) => c.operation === 'create');
++    expect((creates[0].options as any).idempotencyKey).toBe((creates[1].options as any).idempotencyKey);
++    expect((creates[0].input as any).lifecycle).toEqual({ timeoutMs: 3_600_000, onTimeout: 'stop', autoResume: false });
++    expect((creates[0].input as any).storage.volumes).toEqual([{ volume: 'volumes/synthetic-volume', target: '/workspace', mode: 'exclusive' }]);
++    expect((creates[0].input as any).image).toBe('images/synthetic-image'); expect(JSON.stringify(result.metadata)).not.toContain('synthetic-runtime-token');
++  });
++  test('rejects unsupported capabilities and management secrets before creating paid resources', async () => {
++    const f = fixture(); const opts = { accountId: 'synthetic-account', userId: 'synthetic-user', name: 'synthetic-name', sandboxId: 'synthetic-logical', snapshot: 'synthetic-snapshot', envVars: { KORTIX_TOKEN: 'synthetic-runtime-token' } };
++    expect(f.provider.create({ ...opts, workloadType: 'monitor' })).rejects.toThrow('persistent monitor');
++    expect(f.provider.create({ ...opts, locationRequired: true })).rejects.toThrow('requested region');
++    expect(f.provider.create({ ...opts, envVars: { ...opts.envVars, DOCKER_CLOUD_PAT: 'must-not-leave-backend' } })).rejects.toThrow('management credentials');
++    expect(f.calls).toEqual([]);
++  });
++  test('endpoint preserves runtime authentication behind a separate per-sandbox edge credential', async () => {
++    const f = fixture(); const endpoint = await f.provider.resolveEndpoint(externalId);
++    expect(endpoint.headers.Authorization).toBe('Bearer synthetic-runtime-token'); expect(endpoint.headers['x-kortix-docker-cloud-port']).toBe('8000');
++    expect(endpoint.headers['x-kortix-docker-cloud-token']).toHaveLength(64); expect(endpoint.headers['x-kortix-docker-cloud-token']).not.toBe('synthetic-signing-key');
++    expect(f.provider.resolveIngress(externalId, { port: 18080 })).rejects.toThrow('Invalid Docker Cloud target port');
++  });
++});
++
++test('Docker Cloud cached image launch preserves exact resource identity', async () => {
++  const f = fixture();
++  const opts = { accountId: 'synthetic-account', userId: 'synthetic-user', name: 'synthetic-name', sandboxId: 'synthetic-logical', envVars: { KORTIX_TOKEN: 'synthetic-runtime-token' } };
++  const result = await f.provider.createFromExternalId('images/synthetic-image', opts);
++  expect(result.metadata?.image).toBe('images/synthetic-image');
++  await expect(f.provider.createFromExternalId('../untrusted-image', opts)).rejects.toThrow('Invalid Docker Cloud image identity');
++});
++
++test('Docker Cloud never silently leaves workspace ephemeral when given a different volume target', async () => {
++  const f = fixture();
++  await expect(f.provider.create({ accountId: 'synthetic-account', userId: 'synthetic-user', name: 'synthetic-name', sandboxId: 'synthetic-logical', envVars: { KORTIX_TOKEN: 'synthetic-runtime-token' }, volumes: { '/home/kortix': { volume: 'volumes/synthetic-volume' } } })).rejects.toThrow('sole persistent volume at /workspace');
++  expect(f.calls).toEqual([]);
++});
++
++test('Docker Cloud ingress starts use unique identities rather than reusing completed process labels', async () => {
++  const f = fixture(); const starts: any[] = [];
++  f.box.processes.all = () => ({ collect: async () => [] });
++  f.box.processes.run = async (input: any) => ({ exitCode: 0, stdout: input.args?.[2] === 'command -v bun || true' ? '/usr/bin/bun\n' : '', stderr: '', incomplete: false });
++  f.box.processes.start = async (input: any, options: any) => { starts.push({ input, options }); return {}; };
++  await f.provider.start(externalId); await f.provider.start(externalId);
++  expect(starts).toHaveLength(2); expect(starts[0].input.label).not.toBe(starts[1].input.label);
++  expect(starts[0].input.session).toBe(starts[0].input.label); expect(starts[0].options.idempotencyKey).toBe(starts[0].input.label);
++});
++
++test('Docker Cloud managed-image creation inherits the prepared image resources', async () => {
++  const f = fixture();
++  await f.provider.create({ accountId: 'synthetic-account', userId: 'synthetic-user', name: 'synthetic-name', sandboxId: 'synthetic-logical', snapshot: 'synthetic-snapshot', envVars: { KORTIX_TOKEN: 'synthetic-runtime-token' } });
++  expect((f.calls.find((c) => c.operation === 'create')?.input as any).resources).toBeUndefined();
++});
++
++test('Docker Cloud accepts matching image CPU/RAM without an override and rejects mismatches before allocation', async () => {
++  const f = fixture(); const opts = { accountId: 'synthetic-account', userId: 'synthetic-user', name: 'synthetic-name', sandboxId: 'synthetic-logical', snapshot: 'synthetic-snapshot', envVars: { KORTIX_TOKEN: 'synthetic-runtime-token' } };
++  await f.provider.create({ ...opts, resourceSpec: { cpuCores: 2, memoryGb: 4, diskGb: 20 } });
++  expect((f.calls.find((c) => c.operation === 'create')?.input as any).resources).toBeUndefined();
++  const mismatch = fixture();
++  await expect(mismatch.provider.create({ ...opts, resourceSpec: { cpuCores: 4, memoryGb: 8, diskGb: 20 } })).rejects.toThrow('fixed by the prepared image');
++  expect(mismatch.calls).toEqual([]);
++});
++
++test('large runtime checkpoints and removal use bounded five-minute waits', async () => {
++  const f=fixture();let stopBudget=0,deleteBudget=0;
++  f.box.waitUntilStopped=async(options:any)=>{stopBudget=options.timeoutMs;return f.box;};
++  f.box.delete=async()=>f.box;
++  f.box.waitUntilDeleted=async(options:any)=>{deleteBudget=options.timeoutMs;};
++  await f.provider.stop(externalId);await f.provider.remove(externalId);
++  expect(stopBudget).toBe(300000);expect(deleteBudget).toBe(300000);
++});
++
++
++test('foreign native workspace references are rejected before sandbox creation', async () => {
++  const f = fixture();
++  f.client.volumes.get = async () => ({ name: 'volumes/foreign', displayName: 'another-deployment-workspace' });
++  await expect(f.provider.create({ accountId: 'synthetic-account', userId: 'synthetic-user', name: 'synthetic', sandboxId: 'synthetic-logical', snapshot: 'synthetic-snapshot', envVars: { KORTIX_TOKEN: 'synthetic-runtime-token' }, volumes: { '/workspace': { volume: 'volumes/foreign' } } })).rejects.toThrow('not bound');
++  expect(f.calls).toEqual([]);
++});
++
++test('ambiguous create failures carry an owned workspace reconciliation handle without deleting storage', async () => {
++  const f = fixture();
++  const original = new Error('synthetic network ambiguity');
++  f.client.create = async () => { throw original; };
++  await expect(f.provider.create({ accountId: 'synthetic-account', userId: 'synthetic-user', name: 'synthetic', sandboxId: 'synthetic-logical', snapshot: 'synthetic-snapshot', envVars: { KORTIX_TOKEN: 'synthetic-runtime-token' } })).rejects.toBe(original);
++  expect((original as any).dockerCloudRetainedWorkspace.volumeName).toBe('volumes/synthetic-volume');
++  expect((original as any).dockerCloudRetainedWorkspace.workspaceName).toMatch(/^kortix-workspace-[a-f0-9]{64}$/);
++});
+diff --git a/apps/api/src/platform/providers/docker-cloud.ts b/apps/api/src/platform/providers/docker-cloud.ts
+new file mode 100644
+index 00000000..2c793f23
+--- /dev/null
++++ b/apps/api/src/platform/providers/docker-cloud.ts
+@@ -0,0 +1,322 @@
++import { createHmac, randomUUID } from 'node:crypto';
++import { readFile } from 'node:fs/promises';
++import type { Sandboxes, Sandbox, ClientCreateOptions } from '@docker/sandboxes';
++import { config } from '../../config';
++import { sandboxOwnershipMarker } from '../sandbox-ownership';
++import { serviceKeyForExternalId } from '../service-key';
++import { findDockerCloudImages } from '../../snapshots/providers/docker-cloud-builder';
++import {
++  assertWorkloadCredential, SandboxTemplateNotFoundError, type SandboxProvider, type CreateSandboxOpts,
++  type ProvisionResult, type SandboxStartOptions, type SandboxExecOptions,
++  type SandboxExecResult, type SandboxIngressRequest, type ResolvedSandboxIngress,
++  type ResolvedEndpoint, type ProvisioningStatus, type SandboxStatus,
++} from './contract';
++import { isPtyWebSocketPath } from './pty-ingress';
++import {
++  getDockerCloudClient, dockerCloudExternalId, dockerCloudResourceName, dockerCloudNotFound,
++} from './docker-cloud-client';
++import {
++  DOCKER_CLOUD_INGRESS_PORT, DOCKER_CLOUD_INGRESS_TOKEN_HEADER,
++  DOCKER_CLOUD_TARGET_PORT_HEADER, DOCKER_CLOUD_PROXY_SOURCE,
++} from './docker-cloud-proxy';
++import { uploadDockerCloudFile } from './docker-cloud-transfer';
++
++const CALL_TIMEOUT_MS = 30_000;
++const START_TIMEOUT_MS = 300_000;
++const PROXY_SESSION = 'kortix-docker-cloud-ingress-v1';
++const PROXY_DIR = '/tmp/kortix-docker-cloud';
++const OWNER_LABEL = 'kortix.managed';
++const LOGICAL_LABEL = 'kortix.logical_id';
++const WORKLOAD_LABEL = 'kortix.workload';
++
++export function dockerCloudStatus(status: string): SandboxStatus {
++  switch (status) {
++    case 'running': return 'running';
++    case 'stopped': return 'stopped';
++    case 'failed': return 'terminal';
++    case 'deleted': return 'removed';
++    default: return 'unknown';
++  }
++}
++
++/** Renewal does not add an hour to the old expiry; it sets time remaining. */
++export function dockerCloudRenewalDue(status: string, expiresAt: Date | undefined, now: number, thresholdMs: number): boolean {
++  if (status !== 'running') return false;
++  if (!expiresAt || !Number.isFinite(expiresAt.getTime())) throw new Error('Docker Cloud did not report a valid expiration deadline.');
++  return expiresAt.getTime() - now <= thresholdMs;
++}
++
++interface Dependencies {
++  client?: Sandboxes;
++  owner?: () => Promise<string>;
++  signingKey?: () => string;
++  serviceKey?: (id: string) => Promise<string | undefined>;
++  now?: () => number;
++}
++
++/** Keeps Kortix's existing deadline/reaper authoritative; never self-renews in the guest. */
++export class DockerCloudProvider implements SandboxProvider {
++  readonly name = 'docker-cloud' as const;
++  readonly ingressCacheTtlMs = 30_000;
++  readonly provisioning = {
++    async: false,
++    stages: [
++      { id: 'image', progress: 10, message: 'Preparing Docker Cloud runtime image' },
++      { id: 'creating', progress: 40, message: 'Creating Docker Cloud sandbox' },
++      { id: 'runtime', progress: 80, message: 'Connecting authenticated runtime' },
++      { id: 'ready', progress: 100, message: 'Docker Cloud sandbox ready' },
++    ],
++  };
++  constructor(private readonly dependencies: Dependencies = {}) {}
++  private get client(): Sandboxes { return this.dependencies.client ?? getDockerCloudClient(); }
++  private owner(): Promise<string> { return (this.dependencies.owner ?? sandboxOwnershipMarker)(); }
++  private now(): number { return (this.dependencies.now ?? Date.now)(); }
++  private lifetimeMs(): number {
++    const value = config.DOCKER_CLOUD_LIFETIME_MINUTES * 60_000;
++    if (!Number.isFinite(value) || value < 60_000) throw new Error('Invalid Docker Cloud lifetime.');
++    return value;
++  }
++  private proxyKey(owner: string, logicalId: string): string {
++    return createHmac('sha256', this.dependencies.signingKey?.() ?? config.INTERNAL_SERVICE_KEY)
++      .update(JSON.stringify(['kortix-docker-cloud-ingress-v1', owner, logicalId])).digest('hex');
++  }
++  private async get(externalId: string): Promise<Sandbox> {
++    const sandbox = await this.client.get(dockerCloudResourceName(externalId), { timeoutMs: CALL_TIMEOUT_MS });
++    const owner = await this.owner();
++    if (sandbox.core.labels?.[OWNER_LABEL] !== owner || !sandbox.core.labels?.[LOGICAL_LABEL]) {
++      throw new Error('Docker Cloud sandbox does not belong to this Kortix deployment.');
++    }
++    return sandbox;
++  }
++
++  async createFromExternalId(externalTemplateId: string, opts: CreateSandboxOpts): Promise<ProvisionResult> {
++    if (!/^images\/[A-Za-z0-9._-]+$/.test(externalTemplateId)) throw new SandboxTemplateNotFoundError('Invalid Docker Cloud image identity.');
++    try { return await this.create({ ...opts, snapshot: externalTemplateId }); }
++    catch (error) {
++      if (dockerCloudNotFound(error)) throw new SandboxTemplateNotFoundError('The cached Docker Cloud image no longer exists.');
++      throw error;
++    }
++  }
++
++  async create(opts: CreateSandboxOpts): Promise<ProvisionResult> {
++    const envVars = { ...opts.envVars };
++    assertWorkloadCredential(this.name, opts, envVars);
++    if (!opts.sandboxId) throw new Error('Docker Cloud requires a full logical sandboxId for idempotent creation.');
++    if (opts.workloadType === 'monitor') {
++      throw new Error('Docker Cloud persistent monitor workloads are not enabled; use Platinum until always-on support is verified.');
++    }
++    if (opts.locationRequired) throw new Error('Docker Cloud cannot guarantee a requested region; use Platinum for region-bound drives.');
++    if (opts.residentialProxy) throw new Error('Docker Cloud does not implement Kortix residential-proxy routing.');
++    if (Object.keys(envVars).some((key) => /^DOCKER_CLOUD_(PAT|USERNAME)$/.test(key))) {
++      throw new Error('Docker Cloud management credentials must not enter a task sandbox.');
++    }
++    const entries = Object.entries(opts.volumes ?? {});
++    if (entries.length > 1) throw new Error('Docker Cloud currently supports one exclusively attached volume per sandbox.');
++    for (const [path, attachment] of entries) {
++      if (path !== '/workspace') throw new Error('Docker Cloud requires its sole persistent volume at /workspace.');
++      if (!/^volumes\/[A-Za-z0-9._-]+$/.test(attachment.volume) || attachment.read_only || attachment.subdir || attachment.ref || attachment.share) {
++        throw new Error('Docker Cloud requires a native exclusive volume without Platinum-specific mount options.');
++      }
++    }
++    const image = opts.snapshot ?? config.DOCKER_CLOUD_IMAGE;
++    if (!image) throw new Error('No project runtime image is ready for Docker Cloud.');
++    const images = await findDockerCloudImages(image, this.client);
++    const ready = images.filter((candidate) => candidate.status === 'completed').sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
++    if (!ready) throw new SandboxTemplateNotFoundError('The exact Docker Cloud project image is not ready.');
++    if (opts.resourceSpec && (ready.resources?.cpus !== opts.resourceSpec.cpuCores || ready.resources?.memoryMib !== opts.resourceSpec.memoryGb * 1024)) {
++      throw new Error('Docker Cloud CPU/RAM are fixed by the prepared image; build a matching resource-size template before creating this sandbox.');
++    }
++    const owner = await this.owner();
++    const workspaceName = `kortix-workspace-${createHmac('sha256', owner).update(opts.sandboxId).digest('hex')}`;
++    if (entries.length) {
++      const existing = await this.client.volumes.get(entries[0]![1].volume, { timeoutMs: CALL_TIMEOUT_MS });
++      if (existing.displayName !== workspaceName) {
++        throw new Error('Docker Cloud workspace volume is not bound to this deployment and logical sandbox.');
++      }
++    }
++    const volume = entries.length ? undefined : await this.client.volumes.create(
++      { displayName: workspaceName },
++      { timeoutMs: CALL_TIMEOUT_MS, idempotencyKey: `kortix-dc-volume-${owner}-${opts.sandboxId}` },
++    );
++    const volumeName = entries[0]?.[1].volume ?? volume!.name;
++    const mountPath = entries[0]?.[0] ?? '/workspace';
++    const input: ClientCreateOptions = {
++      displayName: opts.name,
++      image: ready.name,
++      environment: envVars,
++      lifecycle: { timeoutMs: this.lifetimeMs(), onTimeout: 'stop', autoResume: false },
++      storage: { volumes: [{ volume: volumeName, target: mountPath, mode: 'exclusive' }] },
++      labels: { [OWNER_LABEL]: owner, [LOGICAL_LABEL]: opts.sandboxId, [WORKLOAD_LABEL]: opts.workloadType ?? 'session' },
++    };
++    let sandbox: Sandbox;
++    try {
++      sandbox = await this.client.create(input, {
++        timeoutMs: START_TIMEOUT_MS,
++        idempotencyKey: `kortix-dc-create-${owner}-${opts.sandboxId}-${opts.createAttempt ?? 0}`,
++      });
++      sandbox = await sandbox.waitUntilRunning({ timeoutMs: START_TIMEOUT_MS });
++    } catch (error) {
++      // Retain potentially accepted storage rather than deleting user bytes on an ambiguous retry.
++      // Expose a reconciliation handle without changing the SDK error classification.
++      if (error instanceof Error) Object.assign(error, { dockerCloudRetainedWorkspace: { volumeName, workspaceName, logicalId: opts.sandboxId } });
++      throw error;
++    }
++    const effective = sandbox.effectiveFeatures;
++    if (effective?.timeouts?.onTimeout !== 'stop' || !effective.timeouts.expiresAt || effective.timeouts.autoResume) {
++      await (await sandbox.stop({ timeoutMs: CALL_TIMEOUT_MS })).waitUntilStopped({ timeoutMs: 60_000 });
++      throw new Error('Docker Cloud did not honor stop-on-expiration without automatic resume.');
++    }
++    if (!effective.managedVolumes?.attachments?.some((a) => a.volume === volumeName && a.target === mountPath)) {
++      await (await sandbox.stop({ timeoutMs: CALL_TIMEOUT_MS })).waitUntilStopped({ timeoutMs: 60_000 });
++      throw new Error('Docker Cloud did not attach the required workspace volume.');
++    }
++    try {
++      await this.ensureProxy(sandbox);
++      const port = await this.publishedProxy(sandbox);
++      return {
++        externalId: dockerCloudExternalId(sandbox.name), baseUrl: this.validPortUrl(port),
++        metadata: {
++          provider: this.name, volumeName, volumeMountPath: mountPath,
++          expiresAt: effective.timeouts.expiresAt.toISOString(), image: ready.name, requestedSnapshot: image,
++          cpuCores: sandbox.core.resources?.cpus, memoryGb: Number(sandbox.core.resources?.memoryMib ?? 4096) / 1024,
++          requestedDiskGb: opts.resourceSpec?.diskGb,
++        },
++      };
++    } catch (error) {
++      // A definite bootstrap failure must not leave paid compute running.
++      // Retain the independent volume; it may contain user files.
++      try { await (await (await this.client.get(sandbox.name)).stop({ timeoutMs: CALL_TIMEOUT_MS })).waitUntilStopped({ timeoutMs: 60_000 }); }
++      catch { /* Provider timeout remains the safety backstop; caller records provisioning failure. */ }
++      throw error;
++    }
++  }
++
++  private async ensureProxy(sandbox: Sandbox): Promise<void> {
++    const check = await sandbox.processes.run({ args: ['/bin/sh', '-c', `mkdir -p ${PROXY_DIR} && chmod 700 ${PROXY_DIR}`], user: 'root' }, { timeoutMs: CALL_TIMEOUT_MS });
++    if (check.exitCode !== 0 || check.incomplete) throw new Error('Unable to initialize private Docker Cloud ingress directory.');
++    const labels = sandbox.core.labels ?? {};
++    await sandbox.files.write(`${PROXY_DIR}/ingress-key`, this.proxyKey(labels[OWNER_LABEL], labels[LOGICAL_LABEL]), {}, { timeoutMs: CALL_TIMEOUT_MS });
++    const processes = await sandbox.processes.all({}, { timeoutMs: CALL_TIMEOUT_MS, signal: AbortSignal.timeout(CALL_TIMEOUT_MS) }).collect();
++    if (processes.some((p) => (p.session === PROXY_SESSION || p.session?.startsWith(`${PROXY_SESSION}-`)) && p.state === 'running')) return;
++    const bun = await sandbox.processes.run({ args: ['/bin/sh', '-c', 'command -v bun || true'], user: 'root' }, { timeoutMs: CALL_TIMEOUT_MS });
++    let argv: string[];
++    if (bun.exitCode === 0 && /^\/[A-Za-z0-9_./-]+$/.test(bun.stdout.trim())) {
++      await sandbox.files.write(`${PROXY_DIR}/proxy.ts`, DOCKER_CLOUD_PROXY_SOURCE, {}, { timeoutMs: CALL_TIMEOUT_MS });
++      argv = [bun.stdout.trim(), `${PROXY_DIR}/proxy.ts`];
++    } else {
++      // App images need no Bun installation: the API image ships a standalone Linux executable.
++      const binary = await readFile(new URL('../../../dist/docker-cloud-ingress', import.meta.url));
++      await uploadDockerCloudFile(sandbox, `${PROXY_DIR}/proxy`, binary, { timeoutMs: START_TIMEOUT_MS, executable: true });
++      argv = [`${PROXY_DIR}/proxy`];
++    }
++    const identity = `${PROXY_SESSION}-${randomUUID()}`;
++    await sandbox.processes.start({ args: argv, user: 'root', session: identity, label: identity }, { timeoutMs: CALL_TIMEOUT_MS, idempotencyKey: identity });
++    // Confirm the actual listening service, not just a successful process-create receipt.
++    const probe = await sandbox.processes.run({ args: [...argv, '--probe'], user: 'root' }, { timeoutMs: CALL_TIMEOUT_MS });
++    if (probe.exitCode !== 0 || probe.incomplete) throw new Error('Docker Cloud authenticated ingress is not ready.');
++  }
++
++  private async publishedProxy(sandbox: Sandbox) {
++    const ports = await sandbox.ports.list({ timeoutMs: CALL_TIMEOUT_MS });
++    // Public raw ports would bypass the auth proxy. Refuse adoption until they are withdrawn.
++    if (ports.published?.some((p) => p.number !== DOCKER_CLOUD_INGRESS_PORT)) {
++      throw new Error('Docker Cloud sandbox has a raw published port; withdraw it before Kortix ingress is enabled.');
++    }
++    const existing = ports.published?.find((p) => p.number === DOCKER_CLOUD_INGRESS_PORT);
++    return existing ?? (await sandbox.ports.create({ number: DOCKER_CLOUD_INGRESS_PORT, protocol: 'tcp' }, { timeoutMs: CALL_TIMEOUT_MS, idempotencyKey: `dc-port-${sandbox.uid}-18080` })).resource;
++  }
++  private validPortUrl(port: { url?: string }): string {
++    if (!port.url) throw new Error('Docker Cloud did not return its published ingress URL.');
++    const url = new URL(port.url);
++    if (url.protocol !== 'https:') throw new Error('Docker Cloud ingress must use HTTPS.');
++    return url.toString().replace(/\/$/, '');
++  }
++
++  async start(externalId: string, options?: SandboxStartOptions): Promise<void> {
++    let sandbox = await this.get(externalId);
++    if (sandbox.status !== 'running') {
++      const progress = setInterval(() => { void options?.onProgress?.().catch(() => undefined); }, 30_000);
++      try { sandbox = await (await sandbox.start({ timeoutMs: CALL_TIMEOUT_MS })).waitUntilRunning({ timeoutMs: START_TIMEOUT_MS }); }
++      finally { clearInterval(progress); }
++    }
++    await this.ensureProxy(sandbox);
++  }
++  async ensureRunning(externalId: string): Promise<void> { await this.start(externalId); }
++  async ensureAppRuntimeStarted(externalId: string): Promise<void> {
++    const sandbox = await this.get(externalId);
++    const result = await sandbox.processes.run({ args: ['/bin/sh', '-c', 'test -x /kortix/bin/kortix-appd'], user: 'root' }, { timeoutMs: CALL_TIMEOUT_MS });
++    if (result.exitCode !== 0) throw new Error('Docker Cloud App image is missing the Kortix App supervisor.');
++    // The original OCI image entrypoint starts appd. Do not launch duplicate supervisors.
++  }
++  async renewLifecycle(externalId: string): Promise<void> {
++    const sandbox = await this.get(externalId);
++    if (!dockerCloudRenewalDue(sandbox.status, sandbox.effectiveFeatures?.timeouts?.expiresAt, this.now(), config.DOCKER_CLOUD_RENEW_BEFORE_MINUTES * 60_000)) return;
++    const changed = await sandbox.renewTimeout({ timeoutMs: this.lifetimeMs() }, { timeoutMs: CALL_TIMEOUT_MS });
++    const deadline = changed.effectiveFeatures?.timeouts?.expiresAt;
++    if (!deadline || deadline.getTime() <= this.now()) throw new Error('Docker Cloud renewal was not confirmed.');
++  }
++  async stop(externalId: string): Promise<void> {
++    const sandbox = await this.get(externalId);
++    if (sandbox.status === 'stopped') return;
++    await (await sandbox.stop({ timeoutMs: CALL_TIMEOUT_MS })).waitUntilStopped({ timeoutMs: START_TIMEOUT_MS });
++  }
++  async remove(externalId: string): Promise<void> {
++    try {
++      const sandbox = await this.get(externalId);
++      const changed = await sandbox.delete({ force: true }, { timeoutMs: CALL_TIMEOUT_MS });
++      await changed?.waitUntilDeleted({ timeoutMs: START_TIMEOUT_MS });
++      // Independent workspace volumes are deliberately retained.
++    } catch (error) { if (!dockerCloudNotFound(error)) throw error; }
++  }
++  async getStatus(externalId: string): Promise<SandboxStatus> {
++    try { return dockerCloudStatus((await this.get(externalId)).status); }
++    catch (error) { return dockerCloudNotFound(error) ? 'removed' : 'unknown'; }
++  }
++  async exec(externalId: string, command: string[], options: SandboxExecOptions): Promise<SandboxExecResult> {
++    const sandbox = await this.get(externalId);
++    const result = await sandbox.processes.run({ args: command, user: 'root' }, { timeoutMs: options.timeoutMs, maxOutputBytes: 16 * 1024 * 1024 });
++    if (result.incomplete) throw new Error('Docker Cloud command output is incomplete.');
++    return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
++  }
++  routeIngress(request: SandboxIngressRequest) {
++    const pty = request.transport === 'websocket' && isPtyWebSocketPath(request.path);
++    return {
++      effectivePort: pty ? 8000 : request.port,
++      websocket: request.transport === 'websocket' && (pty || request.port === 8000)
++        ? { userContextQueryParam: '__kortix_user_context', ...(pty ? { queryDefaults: { cursor: '0' } } : {}) }
++        : undefined,
++    };
++  }
++  async resolveIngress(externalId: string, request: SandboxIngressRequest): Promise<ResolvedSandboxIngress> {
++    const sandbox = await this.get(externalId);
++    if (sandbox.status !== 'running') throw new Error('Docker Cloud sandbox is not running.');
++    const route = this.routeIngress(request);
++    if (!Number.isInteger(route.effectivePort) || route.effectivePort < 1 || route.effectivePort > 65535 || route.effectivePort === DOCKER_CLOUD_INGRESS_PORT) {
++      throw new Error('Invalid Docker Cloud target port.');
++    }
++    await this.ensureProxy(sandbox);
++    const labels = sandbox.core.labels!;
++    return {
++      ...route, url: this.validPortUrl(await this.publishedProxy(sandbox)),
++      headers: {
++        [DOCKER_CLOUD_INGRESS_TOKEN_HEADER]: this.proxyKey(labels[OWNER_LABEL], labels[LOGICAL_LABEL]),
++        [DOCKER_CLOUD_TARGET_PORT_HEADER]: String(route.effectivePort),
++      },
++    };
++  }
++  async resolveEndpoint(externalId: string): Promise<ResolvedEndpoint> {
++    const ingress = await this.resolveIngress(externalId, { port: 8000, transport: 'http' });
++    const serviceKey = await (this.dependencies.serviceKey ?? serviceKeyForExternalId)(externalId);
++    return { url: ingress.url, headers: { ...ingress.headers, 'Content-Type': 'application/json', ...(serviceKey ? { Authorization: `Bearer ${serviceKey}` } : {}) } };
++  }
++  async getProvisioningStatus(_sandboxId: string): Promise<ProvisioningStatus | null> { return null; }
++  async listManagedRunningSandboxes() {
++    const owner = await this.owner();
++    const result: Array<{ externalId: string; createdAt: Date | null }> = [];
++    for await (const sandbox of this.client.all({}, { timeoutMs: CALL_TIMEOUT_MS })) {
++      if (sandbox.status !== 'running' || sandbox.core.labels?.[OWNER_LABEL] !== owner) continue;
++      result.push({ externalId: dockerCloudExternalId(sandbox.name), createdAt: sandbox.core.createdAt ?? null });
++    }
++    return result;
++  }
++}
+diff --git a/apps/api/src/platform/providers/index.ts b/apps/api/src/platform/providers/index.ts
+index 9b36bb71..6801a700 100644
+--- a/apps/api/src/platform/providers/index.ts
++++ b/apps/api/src/platform/providers/index.ts
+@@ -1,6 +1,7 @@
+ import { config, KNOWN_PROVIDERS } from '../../config';
+ import type { ProviderName, SandboxProvider } from './contract';
+ import { DaytonaProvider } from './daytona';
++import { DockerCloudProvider } from './docker-cloud';
+ import { PlatinumProvider } from './platinum';
+ 
+ export * from './contract';
+@@ -35,6 +36,12 @@ export function getProvider(name: ProviderName): SandboxProvider {
+       }
+       provider = new DaytonaProvider();
+       break;
++    case 'docker-cloud':
++      if (!config.DOCKER_CLOUD_USERNAME || !config.DOCKER_CLOUD_PAT) {
++        throw new Error('Docker Cloud provider requires DOCKER_CLOUD_USERNAME and DOCKER_CLOUD_PAT to be set.');
++      }
++      provider = new DockerCloudProvider();
++      break;
+     default: {
+       const exhaustive: never = name;
+       throw new Error(`Unknown sandbox provider: ${exhaustive}`);
+diff --git a/apps/api/src/projects/routes/sandboxes.ts b/apps/api/src/projects/routes/sandboxes.ts
+index e1b71e25..30cc5c9a 100644
+--- a/apps/api/src/projects/routes/sandboxes.ts
++++ b/apps/api/src/projects/routes/sandboxes.ts
+@@ -129,7 +129,7 @@ interface SandboxHealthPayload {
+    */
+   status: ReturnType<typeof serializeSandboxStatus> | null;
+   provider_mode: 'automatic' | 'pinned';
+-  selected_provider: 'platinum' | 'daytona' | null;
++  selected_provider: 'platinum' | 'daytona' | 'docker-cloud' | null;
+ }
+ 
+ // Safe degraded payload: same shape as the happy path, surfaced when any
+diff --git a/apps/api/src/snapshots/provider-coverage.test.ts b/apps/api/src/snapshots/provider-coverage.test.ts
+index 73d0c791..44f5c949 100644
+--- a/apps/api/src/snapshots/provider-coverage.test.ts
++++ b/apps/api/src/snapshots/provider-coverage.test.ts
+@@ -12,7 +12,7 @@ describe('sandbox template provider coverage', () => {
+     // Extends automatically as SANDBOX_TEMPLATE_PROVIDERS grows — this is the
+     // test the reinforcement asked for: adding a provider without wiring it
+     // in here fails loudly instead of silently under-covering it.
+-    expect(SANDBOX_TEMPLATE_PROVIDERS).toEqual(['platinum', 'daytona']);
++    expect(SANDBOX_TEMPLATE_PROVIDERS).toEqual(['platinum', 'daytona', 'docker-cloud']);
+   });
+ 
+   test('synchronizes reusable templates to every enabled provider regardless of routing pins', () => {
+@@ -31,9 +31,9 @@ describe('sandbox template provider coverage', () => {
+     })).toEqual(['platinum']);
+   });
+ 
+-  test('observes the current image independently on Platinum and Daytona', async () => {
++  test('observes the current image independently on every provider', async () => {
+     const calls: string[] = [];
+-    const states = { daytona: 'active', platinum: 'building' } as const;
++    const states = { daytona: 'active', platinum: 'building', 'docker-cloud': 'active' } as const;
+ 
+     const result = await observeTemplateProviderCoverage('kortix-default-current', {
+       isProviderEnabled: () => true,
+@@ -49,11 +49,13 @@ describe('sandbox template provider coverage', () => {
+     expect(calls).toEqual([
+       'platinum:kortix-default-current',
+       'daytona:kortix-default-current',
++      'docker-cloud:kortix-default-current',
+     ]);
+     expect(result.map(({ provider, status, launch_ready }) => ({ provider, status, launch_ready })))
+       .toEqual([
+         { provider: 'platinum', status: 'building', launch_ready: false },
+         { provider: 'daytona', status: 'ready', launch_ready: true },
++        { provider: 'docker-cloud', status: 'ready', launch_ready: true },
+       ]);
+   });
+ 
+diff --git a/apps/api/src/snapshots/provider-coverage.ts b/apps/api/src/snapshots/provider-coverage.ts
+index 6aba3c2f..90b102ea 100644
+--- a/apps/api/src/snapshots/provider-coverage.ts
++++ b/apps/api/src/snapshots/provider-coverage.ts
+@@ -1,7 +1,7 @@
+ import { withTimeout } from '../shared/with-timeout';
+ import type { ProviderState, SandboxProviderAdapter } from './providers';
+ 
+-export const SANDBOX_TEMPLATE_PROVIDERS = ['platinum', 'daytona'] as const;
++export const SANDBOX_TEMPLATE_PROVIDERS = ['platinum', 'daytona', 'docker-cloud'] as const;
+ 
+ export type SandboxTemplateProvider = (typeof SANDBOX_TEMPLATE_PROVIDERS)[number];
+ export type SandboxTemplateProviderCoverageStatus =
+diff --git a/apps/api/src/snapshots/providers/docker-cloud-builder.ts b/apps/api/src/snapshots/providers/docker-cloud-builder.ts
+new file mode 100644
+index 00000000..3b73f8cc
+--- /dev/null
++++ b/apps/api/src/snapshots/providers/docker-cloud-builder.ts
+@@ -0,0 +1,175 @@
++import { randomUUID, createHash } from 'node:crypto';
++import { execFile } from 'node:child_process';
++import { createReadStream } from 'node:fs';
++import { rm } from 'node:fs/promises';
++import { promisify } from 'node:util';
++import { join } from 'node:path';
++import type { Sandbox, Sandboxes, Image } from '@docker/sandboxes';
++import { getDockerCloudClient } from '../../platform/providers/docker-cloud-client';
++import { uploadDockerCloudFile } from '../../platform/providers/docker-cloud-transfer';
++import { runDockerCloudCommand } from '../../platform/providers/docker-cloud-process';
++import { sandboxOwnershipMarker } from '../../platform/sandbox-ownership';
++import {
++  stageRuntimeBuildContext, DEFAULT_CPU, DEFAULT_MEMORY_GB, KORTIX_ENTRYPOINT,
++  type StagedContext,
++} from '../build-context';
++import type { BuildableTemplate, BuildLogTap, BuildSnapshotResult } from './index';
++
++const execFileAsync = promisify(execFile);
++const CALL_TIMEOUT_MS = 30_000;
++const BUILD_TIMEOUT_MS = 30 * 60_000;
++const IMPORT_TIMEOUT_MS = 10 * 60_000;
++
++export function dockerCloudImageDisplayName(owner: string, snapshotName: string): string {
++  const scope = createHash('sha256').update(owner).digest('hex').slice(0, 16);
++  return `kortix-${scope}-${snapshotName}`;
++}
++
++/** Resolve content identity by owned display name; launch only the returned exact resource. */
++export async function findDockerCloudImages(snapshotName: string, client: Sandboxes = getDockerCloudClient()) {
++  const owner = await sandboxOwnershipMarker();
++  if (snapshotName.startsWith('images/')) {
++    const image = await client.images.get(snapshotName, { timeoutMs: CALL_TIMEOUT_MS });
++    if (!image.displayName?.startsWith(dockerCloudImageDisplayName(owner, ''))) {
++      throw new Error('Docker Cloud image is not owned by this deployment.');
++    }
++    return [image];
++  }
++  const name = dockerCloudImageDisplayName(owner, snapshotName);
++  const summaries = await client.images.all({}, { timeoutMs: CALL_TIMEOUT_MS }).collect();
++  const matches = summaries.filter((image) => image.displayName === name);
++  return Promise.all(matches.map((image) => client.images.get(image.name, { timeoutMs: CALL_TIMEOUT_MS })));
++}
++
++async function run(builder: Sandbox, argv: string[], timeoutMs: number, signal?: AbortSignal, onProgress?: (step: number | null) => void): Promise<string> {
++  const result = await runDockerCloudCommand(builder, argv, { timeoutMs, signal, onProgress });
++  if (result.exitCode !== 0) {
++    // Do not log registry credentials or raw provider requests. Docker push errors can contain signed URLs.
++    throw new Error(`Docker Cloud ${argv[0] === 'docker' ? 'Docker command' : 'build preparation'} failed with exit code ${result.exitCode}.`);
++  }
++  return result.stdout;
++}
++
++/** No Windows-host socket, registry password, or Cloud management token enters the builder. */
++export async function importDockerCloudStagedContext(
++  ctx: StagedContext, input: BuildableTemplate, tap?: BuildLogTap,
++  client: Sandboxes = getDockerCloudClient(),
++): Promise<BuildSnapshotResult> {
++  const runId = randomUUID();
++  const controller = new AbortController();
++  let builder: Sandbox | undefined;
++  let image: Image | undefined;
++  let heartbeatFailure: unknown;
++  let heartbeatBusy = false;
++  const archive = join(ctx.contextDir, '..', `docker-cloud-${runId}.tgz`);
++  const heartbeat = setInterval(() => {
++    if (heartbeatBusy) return;
++    heartbeatBusy = true;
++    void Promise.resolve().then(() => tap?.heartbeat?.()).catch((error) => {
++      heartbeatFailure = error; controller.abort();
++    }).finally(() => { heartbeatBusy = false; });
++  }, 20_000);
++  try {
++    await tap?.heartbeat?.();
++    await execFileAsync('tar', ['-czf', archive, '-C', ctx.contextDir, '.'], { timeout: 120_000 });
++    tap?.onLine?.('Uploading the exact staged Kortix Dockerfile and runtime artifacts to an isolated cloud builder.');
++    builder = await client.kits.launchAndWait('shell', {
++      displayName: `kortix-image-build-${runId}`,
++      resources: { cpus: Math.max(2, input.spec.cpu ?? DEFAULT_CPU), memoryMib: Math.max(4096, (input.spec.memoryGb ?? DEFAULT_MEMORY_GB) * 1024) },
++      lifecycle: { timeoutMs: 50 * 60_000, onTimeout: 'delete', autoResume: false },
++      labels: { 'kortix.image_builder_owner': await sandboxOwnershipMarker(), 'kortix.build_id': runId },
++    }, { idempotencyKey: `dc-build-${runId}`, timeoutMs: 180_000, signal: controller.signal });
++    await run(builder, ['mkdir', '-p', '/tmp/kortix-build/context'], CALL_TIMEOUT_MS, controller.signal);
++    await uploadDockerCloudFile(builder, '/tmp/kortix-build/context.tgz', createReadStream(archive, { highWaterMark: 1024 * 1024 }), { timeoutMs: 300_000, signal: controller.signal });
++    tap?.onLine?.('Large runtime context transfer verified by SHA256; extracting before Docker build.');
++    await run(builder, ['tar', '-xzf', '/tmp/kortix-build/context.tgz', '-C', '/tmp/kortix-build/context'], CALL_TIMEOUT_MS, controller.signal);
++    const tag = `kortix-build:${runId}`;
++    // The backend-provided argv has no shell interpolation of project names or Dockerfile contents.
++    await run(builder, ['docker', 'build', '--progress=plain', '--platform', 'linux/amd64', '--tag', tag, '--file', `/tmp/kortix-build/context/${ctx.dockerfileName}`, '/tmp/kortix-build/context'], BUILD_TIMEOUT_MS, controller.signal, (step) => tap?.onLine?.(`Docker Cloud image build remains active${step === null ? '' : ` (step ${step})`}.`));
++    await tap?.heartbeat?.();
++    tap?.onLine?.('Dockerfile build completed; registering a private Docker Cloud managed image.');
++    image = await client.images.create({
++      displayName: dockerCloudImageDisplayName(await sandboxOwnershipMarker(), input.snapshotName),
++      fromImage: { captureMode: 'disk', resources: { cpus: input.spec.cpu ?? DEFAULT_CPU, memoryMib: (input.spec.memoryGb ?? DEFAULT_MEMORY_GB) * 1024 } },
++      // Standard/My Kortix use the shared entrypoint. App images preserve their own OCI entrypoint.
++      ...(input.entrypoint ? { startCmd: input.entrypoint } : input.runtimeProfile === 'app' ? {} : { startCmd: [KORTIX_ENTRYPOINT] }),
++    }, { idempotencyKey: `dc-image-${runId}`, timeoutMs: CALL_TIMEOUT_MS, signal: controller.signal });
++    const target = image.pushTarget;
++    if (!target?.imageRef || !target.accessToken || (target.accessTokenExpiresAt && target.accessTokenExpiresAt.getTime() <= Date.now())) {
++      throw new Error('Docker Cloud did not return a valid private image upload destination.');
++    }
++    const registry = target.imageRef.split('/')[0];
++    if (!/^[A-Za-z0-9.-]+(?::\d+)?$/.test(registry)) throw new Error('Invalid Docker Cloud private registry host.');
++    const username = target.imageRef.split('/')[1];
++    if (!/^[A-Za-z0-9._-]+$/.test(username ?? '')) throw new Error('Invalid Docker Cloud image upload namespace.');
++    await run(builder, ['mkdir', '-p', '/tmp/kortix-upload'], CALL_TIMEOUT_MS, controller.signal);
++    await run(builder, ['chmod', '700', '/tmp/kortix-upload'], CALL_TIMEOUT_MS, controller.signal);
++    // The temporary password authenticates as the IMAGE NAMESPACE, not the operator's Docker ID.
++    // Only the isolated builder's private auth file changes; no global docker login is performed.
++    const auth = { auth: Buffer.from(`${username}:${target.accessToken}`).toString('base64') };
++    const credentials = JSON.stringify({ auths: {
++      [registry]: auth,
++      ...(registry === 'docker.io' ? { 'https://index.docker.io/v1/': auth } : {}),
++    } });
++    await builder.files.write('/tmp/kortix-upload/config.json', credentials, {}, { timeoutMs: CALL_TIMEOUT_MS, signal: controller.signal });
++    await run(builder, ['docker', 'tag', tag, target.imageRef], CALL_TIMEOUT_MS, controller.signal);
++    await run(builder, ['docker', '--config', '/tmp/kortix-upload', 'push', target.imageRef], IMPORT_TIMEOUT_MS, controller.signal);
++    await run(builder, ['rm', '-rf', '/tmp/kortix-upload'], CALL_TIMEOUT_MS, controller.signal);
++    try {
++      const deleted = await (await client.get(builder.name, { timeoutMs: CALL_TIMEOUT_MS })).delete({ force: true }, { timeoutMs: CALL_TIMEOUT_MS });
++      await deleted?.waitUntilDeleted({ timeoutMs: 60_000 });
++      builder = undefined;
++      tap?.onLine?.('Private image upload completed; isolated builder removed before managed-image preparation.');
++    } catch { /* Retry cleanup in finally; the bounded provider timeout remains active. */ }
++    const deadline = Date.now() + IMPORT_TIMEOUT_MS;
++    while (Date.now() < deadline) {
++      await tap?.heartbeat?.();
++      image = await client.images.get(image.name, { timeoutMs: CALL_TIMEOUT_MS, signal: controller.signal });
++      if (image.status === 'completed') {
++        if (!image.imageDigest) throw new Error('Docker Cloud completed image has no digest.');
++        tap?.onLine?.('Docker Cloud managed image is ready; exact external template identity pinned.');
++        return { externalTemplateId: image.name };
++      }
++      if (image.status === 'failed' || image.status === 'deleted') throw new Error('Docker Cloud image preparation failed.');
++      await new Promise((resolve) => setTimeout(resolve, 2_000));
++    }
++    throw new Error('Docker Cloud managed image preparation exceeded its deadline.');
++  } catch (error) {
++    if (image) {
++      try {
++        const current = await client.images.get(image.name, { timeoutMs: CALL_TIMEOUT_MS });
++        // Never delete a completed image: a concurrent authorized caller may already have pinned it.
++        if (current.status !== 'completed') await current.delete({ timeoutMs: CALL_TIMEOUT_MS });
++      } catch { console.warn('[docker-cloud] Incomplete image registration cleanup not confirmed.'); }
++    }
++    if (heartbeatFailure) throw heartbeatFailure;
++    throw error;
++  } finally {
++    clearInterval(heartbeat);
++    await rm(archive, { force: true }).catch(() => undefined);
++    if (builder) {
++      // Scrub temporary upload credentials even if push failed or the main signal was aborted.
++      try { await builder.processes.run({ args: ['rm', '-rf', '/tmp/kortix-upload'], user: 'root' }, { timeoutMs: CALL_TIMEOUT_MS }); }
++      catch { console.warn('[docker-cloud] Temporary upload credential cleanup not confirmed.'); }
++      try {
++        const current = await client.get(builder.name, { timeoutMs: CALL_TIMEOUT_MS });
++        const deleted = await current.delete({ force: true }, { timeoutMs: CALL_TIMEOUT_MS });
++        await deleted?.waitUntilDeleted({ timeoutMs: 60_000 });
++      } catch {
++        // Not included in the session reaper. Provider delete-on-timeout is a bounded crash backstop.
++        console.warn('[docker-cloud] Image-builder cleanup not confirmed; provider timeout remains active.');
++      }
++    }
++  }
++}
++
++export async function buildDockerCloudImage(input: BuildableTemplate, tap?: BuildLogTap): Promise<BuildSnapshotResult> {
++  if (!input.image && !input.userDockerfile) throw new Error('Docker Cloud image build requires an image or Dockerfile.');
++  if (input.region) throw new Error('Docker Cloud cannot honor a region-pinned image build.');
++  const ctx = await stageRuntimeBuildContext({
++    snapshotName: input.snapshotName, userDockerfile: input.userDockerfile ?? `FROM ${input.image}\n`,
++    runtimeProfile: input.runtimeProfile, appContext: input.appContext, containerRuntime: input.containerRuntime,
++  });
++  try { return await importDockerCloudStagedContext(ctx, input, tap); }
++  finally { await rm(ctx.contextDir, { recursive: true, force: true }); }
++}
+diff --git a/apps/api/src/snapshots/providers/docker-cloud.ts b/apps/api/src/snapshots/providers/docker-cloud.ts
+new file mode 100644
+index 00000000..889dd993
+--- /dev/null
++++ b/apps/api/src/snapshots/providers/docker-cloud.ts
+@@ -0,0 +1,72 @@
++import { getDockerCloudClient, dockerCloudNotFound } from '../../platform/providers/docker-cloud-client';
++import { sandboxOwnershipMarker } from '../../platform/sandbox-ownership';
++import { buildDockerCloudImage, dockerCloudImageDisplayName, findDockerCloudImages } from './docker-cloud-builder';
++import type { BuildLogTap, BuildableTemplate, BuildSnapshotResult, ProviderState, SandboxProviderAdapter } from './index';
++
++export function dockerCloudImageState(status: string): ProviderState {
++  switch (status) {
++    case 'completed': return 'active';
++    case 'failed': return 'build_failed';
++    case 'deleted': return 'missing';
++    case 'pending': case 'waitingForPush': case 'preparing': return 'building';
++    default: return 'unknown';
++  }
++}
++
++/** Docker Cloud uses an OCI builder plus private image import, not a different runtime image. */
++export class DockerCloudImageAdapter implements SandboxProviderAdapter {
++  readonly id = 'docker-cloud' as const;
++  isConfigured(): boolean {
++    try { getDockerCloudClient(); return true; } catch { return false; }
++  }
++  async buildSnapshot(input: BuildableTemplate, tap?: BuildLogTap): Promise<BuildSnapshotResult> {
++    const existing = await this.getSnapshotExternalId(input.snapshotName);
++    if (existing && (await this.getSnapshotStateByExternalId(existing)) === 'active') return { externalTemplateId: existing };
++    return buildDockerCloudImage(input, tap);
++  }
++  async getSnapshotExternalId(snapshotName: string): Promise<string | null> {
++    const images = await findDockerCloudImages(snapshotName);
++    const ready = images.filter((image) => image.status === 'completed').sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
++    if (ready[0]) return ready[0].name;
++    const newest = images.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
++    return newest?.name ?? null;
++  }
++  async getSnapshotState(snapshotName: string): Promise<ProviderState> {
++    try {
++      const images = await findDockerCloudImages(snapshotName);
++      if (!images.length) return 'missing';
++      if (images.some((image) => image.status === 'completed')) return 'active';
++      const newest = images.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
++      // A crashed builder cannot refresh the one-time upload token. Permit a fresh build instead of hanging forever.
++      if (newest.status === 'waitingForPush' && Date.now() - newest.createdAt.getTime() > 30 * 60_000) return 'build_failed';
++      return dockerCloudImageState(newest.status);
++    } catch (error) { return dockerCloudNotFound(error) ? 'missing' : 'unknown'; }
++  }
++  async getSnapshotStateByExternalId(externalId: string): Promise<ProviderState> {
++    try {
++      const images = await findDockerCloudImages(externalId);
++      return images[0] ? dockerCloudImageState(images[0].status) : 'missing';
++    }
++    catch (error) { return dockerCloudNotFound(error) ? 'missing' : 'unknown'; }
++  }
++  async findFirstActiveSnapshot(names: readonly string[]): Promise<string | null> {
++    for (const name of names) if ((await this.getSnapshotState(name)) === 'active') return name;
++    return null;
++  }
++  async deleteSnapshot(snapshotName: string): Promise<void> {
++    try {
++      const images = await findDockerCloudImages(snapshotName);
++      const prefix = dockerCloudImageDisplayName(await sandboxOwnershipMarker(), '');
++      for (const image of images) {
++        if (!image.displayName?.startsWith(prefix)) throw new Error('Docker Cloud image is not owned by this deployment.');
++        try { await image.delete({ timeoutMs: 30_000 }); } catch (error) { if (!dockerCloudNotFound(error)) throw error; }
++      }
++    } catch (error) { if (!dockerCloudNotFound(error)) throw error; }
++  }
++  async listSnapshots(): Promise<Array<{ name: string }>> {
++    const prefix = dockerCloudImageDisplayName(await sandboxOwnershipMarker(), '');
++    const images = await getDockerCloudClient().images.all({}, { timeoutMs: 30_000 }).collect();
++    return images.filter((image) => image.displayName?.startsWith(prefix)).map((image) => ({ name: image.displayName!.slice(prefix.length) }));
++  }
++}
++export const dockerCloudImageProvider = new DockerCloudImageAdapter();
+diff --git a/apps/api/src/snapshots/providers/index.ts b/apps/api/src/snapshots/providers/index.ts
+index b7993a08..d66c7212 100644
+--- a/apps/api/src/snapshots/providers/index.ts
++++ b/apps/api/src/snapshots/providers/index.ts
+@@ -5,12 +5,14 @@
+  * reference) and Daytona (legacy fallback, removal scheduled) implement the
+  * `SandboxProviderAdapter` interface and slot in here.
+  *
+- * The provider is identified by a stable string (`platinum` or `daytona`) that
++ * The provider is identified by a stable string (`platinum`, `daytona`, or
++ * `docker-cloud`) that
+  * lives on the template row. The session boot path resolves the
+  * adapter by that string and delegates the actual snapshot build / state check.
+  */
+ 
+ import { daytonaProvider } from './daytona';
++import { dockerCloudImageProvider } from './docker-cloud';
+ import { platinumProvider } from './platinum';
+ 
+ interface SandboxResourceSpec {
+@@ -158,6 +160,7 @@ export interface SandboxProviderAdapter {
+ 
+ const ADAPTERS = new Map<string, SandboxProviderAdapter>();
+ ADAPTERS.set(daytonaProvider.id, daytonaProvider);
++ADAPTERS.set(dockerCloudImageProvider.id, dockerCloudImageProvider);
+ ADAPTERS.set(platinumProvider.id, platinumProvider);
+ 
+ export function getSandboxProvider(id: string): SandboxProviderAdapter {
+diff --git a/apps/cli/src/commands/self-host.ts b/apps/cli/src/commands/self-host.ts
+index 1ba99afd..d7268733 100644
+--- a/apps/cli/src/commands/self-host.ts
++++ b/apps/cli/src/commands/self-host.ts
+@@ -2749,11 +2749,21 @@ export function sandboxProviders(env: Record<string, string>): string[] {
+ const SANDBOX_PROVIDER_KEY: Record<string, string> = {
+   platinum: 'PLATINUM_API_KEY',
+   daytona: 'DAYTONA_API_KEY',
++  'docker-cloud': 'DOCKER_CLOUD_PAT',
++};
++const SANDBOX_PROVIDER_KEYS: Record<string, readonly string[]> = {
++  platinum: ['PLATINUM_API_KEY'],
++  daytona: ['DAYTONA_API_KEY'],
++  'docker-cloud': ['DOCKER_CLOUD_USERNAME', 'DOCKER_CLOUD_PAT'],
+ };
+ 
+ /** A configured sandbox provider is selected and has its required key. */
+ export function sandboxProviderConfigured(env: Record<string, string>): boolean {
+-  return sandboxProviders(env).some((provider) => !!env[SANDBOX_PROVIDER_KEY[provider] ?? '']);
++  return sandboxProviders(env).some((provider) =>
++    (SANDBOX_PROVIDER_KEYS[provider] ?? [SANDBOX_PROVIDER_KEY[provider] ?? '']).every(
++      (key) => !!env[key],
++    ),
++  );
+ }
+ 
+ /** Managed git provider configured? Required to create/CRUD projects. */
+@@ -3224,6 +3234,12 @@ function defaultEnv(flags: GlobalFlags): SelfHostEnv {
+     // env still names the legacy provider (SandboxProviderName in
+     // apps/api/src/config.ts).
+     DAYTONA_API_KEY: '',
++    DOCKER_CLOUD_USERNAME: '',
++    DOCKER_CLOUD_PAT: '',
++    DOCKER_CLOUD_IMAGE: '',
++    DOCKER_CLOUD_LIFETIME_MINUTES: '60',
++    DOCKER_CLOUD_RENEW_BEFORE_MINUTES: '20',
++    DOCKER_CLOUD_ENVIRONMENT: '',
+     PLATINUM_API_KEY: '',
+     PLATINUM_API_URL: '',
+     PLATINUM_TEMPLATE: '',
+diff --git a/apps/cli/src/self-host/secrets-registry.ts b/apps/cli/src/self-host/secrets-registry.ts
+index 0f047fde..1ac45bf6 100644
+--- a/apps/cli/src/self-host/secrets-registry.ts
++++ b/apps/cli/src/self-host/secrets-registry.ts
+@@ -136,6 +136,8 @@ export const SECRET_DEFS: SecretDef[] = [
+   // because it's unconditionally needed.
+   { key: 'PLATINUM_API_KEY', category: 'sandbox', kind: 'operator', required: true },
+   { key: 'DAYTONA_API_KEY', category: 'sandbox', kind: 'operator', required: false },
++  { key: 'DOCKER_CLOUD_USERNAME', category: 'sandbox', kind: 'operator', required: false },
++  { key: 'DOCKER_CLOUD_PAT', category: 'sandbox', kind: 'operator', required: false },
+   { key: 'PLATINUM_WEBHOOK_SECRET', category: 'sandbox', kind: 'operator', required: false },
+ 
+   // Managed git — NOT init-required: configured in-app (Settings → Git,
+@@ -303,6 +305,12 @@ export const KEY_SERVICE_MAP: Record<string, readonly string[]> = {
+   DAYTONA_API_KEY: ['kortix-api'],
+   DAYTONA_SERVER_URL: ['kortix-api'],
+   DAYTONA_TARGET: ['kortix-api'],
++  DOCKER_CLOUD_USERNAME: ['kortix-api'],
++  DOCKER_CLOUD_PAT: ['kortix-api'],
++  DOCKER_CLOUD_IMAGE: ['kortix-api'],
++  DOCKER_CLOUD_LIFETIME_MINUTES: ['kortix-api'],
++  DOCKER_CLOUD_RENEW_BEFORE_MINUTES: ['kortix-api'],
++  DOCKER_CLOUD_ENVIRONMENT: ['kortix-api'],
+   PLATINUM_API_KEY: ['kortix-api'],
+   PLATINUM_API_URL: ['kortix-api'],
+   PLATINUM_TEMPLATE: ['kortix-api'],
+diff --git a/apps/cli/src/self-host/shared-runtime-defaults.ts b/apps/cli/src/self-host/shared-runtime-defaults.ts
+index f69c6770..d286e69a 100644
+--- a/apps/cli/src/self-host/shared-runtime-defaults.ts
++++ b/apps/cli/src/self-host/shared-runtime-defaults.ts
+@@ -45,6 +45,9 @@ export const SHARED_SANDBOX_DEFAULTS: Record<string, string> = {
+   ALLOWED_SANDBOX_PROVIDERS: 'platinum',
+   DAYTONA_SERVER_URL: 'https://app.daytona.io/api',
+   DAYTONA_TARGET: 'us',
++  DOCKER_CLOUD_IMAGE: '',
++  DOCKER_CLOUD_LIFETIME_MINUTES: '60',
++  DOCKER_CLOUD_RENEW_BEFORE_MINUTES: '20',
+ };
+ 
+ /**
+diff --git a/packages/api-contract/src/index.ts b/packages/api-contract/src/index.ts
+index 753115b0..ac36c84a 100644
+--- a/packages/api-contract/src/index.ts
++++ b/packages/api-contract/src/index.ts
+@@ -142,7 +142,7 @@ export type ProjectRole = z.infer<typeof ProjectRoleSchema>;
+ /** Every sandbox provider the current platform can select or emit. */
+ // Platinum is the reference provider; Daytona is a legacy fallback (removal
+ // scheduled). E2B support is discontinued.
+-export const SANDBOX_PROVIDERS = ['platinum', 'daytona'] as const;
++export const SANDBOX_PROVIDERS = ['platinum', 'daytona', 'docker-cloud'] as const;
+ export const SandboxProviderSchema = z.enum(SANDBOX_PROVIDERS);
+ export type SandboxProvider = z.infer<typeof SandboxProviderSchema>;
+ 
+diff --git a/packages/db/migrations/20261117221000000_sandbox_provider_add_docker_cloud.sql b/packages/db/migrations/20261117221000000_sandbox_provider_add_docker_cloud.sql
+new file mode 100644
+index 00000000..74ed845c
+--- /dev/null
++++ b/packages/db/migrations/20261117221000000_sandbox_provider_add_docker_cloud.sql
+@@ -0,0 +1,10 @@
++-- Add docker-cloud to the active sandbox_provider enum.
++--
++-- ADD VALUE only: this migration never writes the new enum value in the same
++-- transaction (PostgreSQL forbids that). Existing rows remain unchanged, and
++-- Platinum remains the application default.
++--
++-- enum-value-checked: fresh schemas and every faked baseline currently expose
++-- only daytona, platinum, and the retired-readable e2b value; docker-cloud is
++-- absent until this forward migration runs.
++ALTER TYPE "kortix"."sandbox_provider" ADD VALUE IF NOT EXISTS 'docker-cloud';
+diff --git a/packages/db/src/schema/kortix.test.ts b/packages/db/src/schema/kortix.test.ts
+index 4d08b1be..0a0b0751 100644
+--- a/packages/db/src/schema/kortix.test.ts
++++ b/packages/db/src/schema/kortix.test.ts
+@@ -100,7 +100,7 @@ describe('kortix enums', () => {
+ 
+   test('sandbox_provider enum lists supported providers', () => {
+     expect(sandboxProviderEnum.enumName).toBe('sandbox_provider');
+-    expect(sandboxProviderEnum.enumValues).toEqual(['daytona', 'platinum', 'e2b']);
++    expect(sandboxProviderEnum.enumValues).toEqual(['daytona', 'platinum', 'e2b', 'docker-cloud']);
+   });
+ 
+   test('project_status enum is active or archived', () => {
+diff --git a/packages/db/src/schema/kortix.ts b/packages/db/src/schema/kortix.ts
+index 168b9893..0a5ce9ed 100644
+--- a/packages/db/src/schema/kortix.ts
++++ b/packages/db/src/schema/kortix.ts
+@@ -69,6 +69,7 @@ export const sandboxProviderEnum = kortixSchema.enum('sandbox_provider', [
+   'daytona',
+   'platinum',
+   'e2b',
++  'docker-cloud',
+ ]);
+ 
+ export const projectStatusEnum = kortixSchema.enum('project_status', ['active', 'archived']);
+diff --git a/packages/sdk/src/core/rest/platform-client/types.ts b/packages/sdk/src/core/rest/platform-client/types.ts
+index 0b279d98..b4fc0708 100644
+--- a/packages/sdk/src/core/rest/platform-client/types.ts
++++ b/packages/sdk/src/core/rest/platform-client/types.ts
+@@ -25,7 +25,7 @@ export const SANDBOX_PORTS = {
+  * Platinum is the reference provider. Daytona is a legacy fallback whose
+  * removal is scheduled. E2B support is discontinued.
+  */
+-export type SandboxProviderName = 'platinum' | 'daytona';
++export type SandboxProviderName = 'platinum' | 'daytona' | 'docker-cloud';
+ export type ServerTypeOption = string;
+ 
+ export interface SandboxCreateProgress {
+diff --git a/packages/sdk/src/core/rest/projects-client/sandbox.ts b/packages/sdk/src/core/rest/projects-client/sandbox.ts
+index 7a6e2bf2..ddd6e718 100644
+--- a/packages/sdk/src/core/rest/projects-client/sandbox.ts
++++ b/packages/sdk/src/core/rest/projects-client/sandbox.ts
+@@ -66,7 +66,7 @@ export interface SandboxTemplate {
+    * routing mode; this array preserves the independent provider truth.
+    */
+   provider_coverage?: Array<{
+-    provider: 'platinum' | 'daytona';
++    provider: 'platinum' | 'daytona' | 'docker-cloud';
+     available: boolean;
+     snapshot_name: string;
+     state: 'active' | 'building' | 'build_failed' | 'removing' | 'unknown' | 'missing' | null;
+diff --git a/packages/sdk/src/core/rest/projects-client/session-sandbox.ts b/packages/sdk/src/core/rest/projects-client/session-sandbox.ts
+index 9dda4ef9..558a454d 100644
+--- a/packages/sdk/src/core/rest/projects-client/session-sandbox.ts
++++ b/packages/sdk/src/core/rest/projects-client/session-sandbox.ts
+@@ -25,7 +25,7 @@ export interface ProjectSessionSandbox {
+   session_id: string;
+   project_id: string;
+   account_id: string;
+-  provider: "platinum" | "daytona";
++  provider: "platinum" | "daytona" | "docker-cloud";
+   external_id: string | null;
+   base_url: string | null;
+   status: ProjectSessionSandboxStatus;
+diff --git a/packages/sdk/src/core/rest/projects-client/sessions.ts b/packages/sdk/src/core/rest/projects-client/sessions.ts
+index 3b84fb0a..e608c735 100644
+--- a/packages/sdk/src/core/rest/projects-client/sessions.ts
++++ b/packages/sdk/src/core/rest/projects-client/sessions.ts
+@@ -108,7 +108,7 @@ export interface ProjectSession {
+   project_id: string;
+   branch_name: string;
+   base_ref: string;
+-  sandbox_provider: 'platinum' | 'daytona' | null;
++  sandbox_provider: 'platinum' | 'daytona' | 'docker-cloud' | null;
+   /** Null until the session has a sandbox. */
+   sandbox_id: string | null;
+   sandbox_url: string | null;
+@@ -326,7 +326,7 @@ export interface CreateProjectSessionInput {
+   labels?: string[];
+   /** Client-generated RFC 4122 v4 UUID for optimistic navigation. */
+   session_id?: string;
+-  provider?: 'platinum' | 'daytona';
++  provider?: 'platinum' | 'daytona' | 'docker-cloud';
+   /** @deprecated Withdrawn — persistent machines left the product. The API ignores it. Removed in the next major. */
+   persistent_machine?: boolean;
+   branch_already_created?: boolean;
+diff --git a/packages/ui/src/internal/lib/sandbox-providers.ts b/packages/ui/src/internal/lib/sandbox-providers.ts
+index 0ffb086f..7b2adc4d 100644
+--- a/packages/ui/src/internal/lib/sandbox-providers.ts
++++ b/packages/ui/src/internal/lib/sandbox-providers.ts
+@@ -2,6 +2,7 @@
+ 
+ const PROVIDER_LABEL: Record<string, string> = {
+   platinum: 'Platinum',
++  'docker-cloud': 'Docker Cloud',
+   daytona: 'Daytona',
+ };
+ 
+@@ -10,7 +11,7 @@ export function isLegacySandboxProvider(provider: string): boolean {
+   return provider === 'daytona';
+ }
+ 
+-/** Sort key: Platinum first, legacy providers last. */
++/** Sort key: Platinum first, supported alternatives next, legacy providers last. */
+ export function sandboxProviderRank(provider: string): number {
+   return provider === 'platinum' ? 0 : isLegacySandboxProvider(provider) ? 2 : 1;
+ }
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 4e053841..f178930f 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -258,6 +258,9 @@ importers:
+       '@daytonaio/sdk':
+         specifier: ^0.184.0
+         version: 0.184.0(ws@8.22.0)
++      '@docker/sandboxes':
++        specifier: 0.53.0
++        version: 0.53.0
+       '@hono/zod-openapi':
+         specifier: 1.6.2
+         version: 1.6.2(hono@4.13.11)(zod@4.6.7)
+@@ -4923,6 +4926,10 @@ packages:
+     dev: false
+     optional: true
+ 
++  /@bufbuild/protobuf@2.17.0:
++    resolution: {integrity: sha512-hcPkSz6D7MiTU/5VBBhK+kxaYDoOdQ6yJRFJ3kS8Nydp+VZXfg1vrpABKPNod8bXMufsVCmiUJVIKFzCzta4uw==}
++    dev: false
++
+   /@calcom/embed-core@1.5.3:
+     resolution: {integrity: sha512-GeId9gaByJ5EWiPmuvelZOvFWPOTWkcWZr5vGTCbIUTX125oE5yn0n8lDF1MJk5Xj1WO+/dk9jKIE08Ad9ytiQ==}
+     dev: false
+@@ -5420,6 +5427,24 @@ packages:
+     resolution: {integrity: sha512-uekIGetywIgopfD97oDL5PfeezkFpNhwlzlaEYNOA0N6ghdsOvh/HYjSMek5Q2O1PYvRSDFcqFVJl4r4ZBwOow==}
+     dev: false
+ 
++  /@docker/sandboxes@0.53.0:
++    resolution: {integrity: sha512-copLxQxHrUAmMdyolkGHr5t5nzOe4+fHdsizT4KpyjRp+pauiwzFlLYRQEqsvigte9kJiCNyIS7dqqxTm5x0Ng==}
++    engines: {node: '>=20'}
++    dependencies:
++      '@bufbuild/protobuf': 2.17.0
++      '@types/formidable': 3.4.6
++      '@types/ws': 8.18.1
++      formidable: 3.5.4
++      jose: 6.2.12
++      openapi-fetch: 0.17.0
++      p-retry: 7.1.0
++      undici: 6.29.1
++      ws: 8.22.0
++    transitivePeerDependencies:
++      - bufferutil
++      - utf-8-validate
++    dev: false
++
+   /@dotenvx/dotenvx@2.38.2:
+     resolution: {integrity: sha512-+tjy8o//H+ZkRfRWLh08UkLHCw/e74uIV27QOZ3RxKwXvGrxjEcQMfUvQJzkvK/qNTk/OsE1MlGiDB6iL+1X0g==}
+     hasBin: true
+@@ -8530,7 +8555,6 @@ packages:
+   /@noble/hashes@1.8.0:
+     resolution: {integrity: sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A==}
+     engines: {node: ^14.21.3 || >=16}
+-    dev: true
+ 
+   /@noble/hashes@2.4.0:
+     resolution: {integrity: sha512-X5XaVWZIBCT7HHZGm5I7ZQXDwLG+bGXuSrMQAW+7Zvl87h1kmc1ZB1VSRJcpUfoUrGQp4Fkoxm5kZ+Ms+aW+eA==}
+@@ -9353,6 +9377,12 @@ packages:
+     resolution: {integrity: sha512-AcNDY4J66YQHUfQYFInkCP7M9VOje0od7wLpOR7LtCmc532opJy6ll+h1W9zBovz8tt9U7OADUmJ/qKEXyOX/A==}
+     dev: false
+ 
++  /@paralleldrive/cuid2@2.3.1:
++    resolution: {integrity: sha512-XO7cAxhnTZl0Yggq6jOgjiOHhbgcO4NqFqwSmQpjK3b6TEE6Uj/jfSk6wzYyemh3+I0sHirKSetjQwn5cZktFw==}
++    dependencies:
++      '@noble/hashes': 1.8.0
++    dev: false
++
+   /@parcel/watcher-android-arm64@2.5.1:
+     resolution: {integrity: sha512-KF8+j9nNbUN8vzOFDpRMsaKBHZ/mcjEjMToVMJOhTozkDonQFFrRcfdLWn6yWKCmJKmdVxSgHiYvTCef4/qcBA==}
+     engines: {node: '>= 10.0.0'}
+@@ -15473,6 +15503,12 @@ packages:
+     resolution: {integrity: sha512-xFU8ZXTw4gd358lb2jw25nxY9QAgqn2+bKKjKOYfNCzN4DKCFetK7sPtrlpg66Ywe3vWY9FNxprZawAh9wfJ3g==}
+     dev: true
+ 
++  /@types/formidable@3.4.6:
++    resolution: {integrity: sha512-LI4Hk+KNsM5q7br4oMVoaWeb+gUqJpz1N8+Y2Q6Cz9cVH33ybahRKUWaRmMboVlkwSbOUGgwc/pEkS7yMSzoWg==}
++    dependencies:
++      '@types/node': 20.19.43
++    dev: false
++
+   /@types/fs-extra@9.0.13:
+     resolution: {integrity: sha512-nEnwB++1u5lVDM2UI4c1+5R+FYaKfaAzS4OococimjVm3nQw3TuzH5UNsocrcTBbhnerblyHj4A49qXbIiZdpA==}
+     dependencies:
+@@ -19678,6 +19714,13 @@ packages:
+     dependencies:
+       dequal: 2.0.3
+ 
++  /dezalgo@1.0.4:
++    resolution: {integrity: sha512-rXSP0bf+5n0Qonsb+SVVfNfIsimO4HEtmnIpPHY8Q1UCzKlQrDMfdobr8nJOOsRgWCyMRqeSBQzmWUMq7zvVig==}
++    dependencies:
++      asap: 2.0.6
++      wrappy: 1.0.2
++    dev: false
++
+   /diacritics@1.3.0:
+     resolution: {integrity: sha512-wlwEkqcsaxvPJML+rDh/2iS824jbREk6DUMUKkEaSlxdYHeS43cClJtsWglvw2RfeXGm6ohKDqsXteJ5sP5enA==}
+     dev: false
+@@ -22081,6 +22124,15 @@ packages:
+       fetch-blob: 3.2.0
+     dev: false
+ 
++  /formidable@3.5.4:
++    resolution: {integrity: sha512-YikH+7CUTOtP44ZTnUhR7Ic2UASBPOqmaRkRKxRbywPTe5VxF7RRCck4af9wutiZ/QKM5nME9Bie2fFaPz5Gug==}
++    engines: {node: '>=14.0.0'}
++    dependencies:
++      '@paralleldrive/cuid2': 2.3.1
++      dezalgo: 1.0.4
++      once: 1.4.0
++    dev: false
++
+   /forwarded-parse@2.1.2:
+     resolution: {integrity: sha512-alTFZZQDKMporBH77856pXgzhEzaUVmLCDk+egLgIgHst3Tpndzz8MnKe+GzRJRfvVdn69HhpW7cmXzvtLvJAw==}
+     dev: false
+@@ -26458,6 +26510,12 @@ packages:
+       zod: 4.6.7
+     dev: false
+ 
++  /openapi-fetch@0.17.0:
++    resolution: {integrity: sha512-PsbZR1wAPcG91eEthKhN+Zn92FMHxv+/faECIwjXdxfTODGSGegYv0sc1Olz+HYPvKOuoXfp+0pA2XVt2cI0Ig==}
++    dependencies:
++      openapi-typescript-helpers: 0.1.0
++    dev: false
++
+   /openapi-sampler@1.7.5:
+     resolution: {integrity: sha512-zpnod1EYNkMP3xg18bhMknvzdaxz5ePUyHakO/7zwEIq/Y8T0SsliS9a+YXCWQCvn+5LfE//UtDVoUULcKdVAQ==}
+     dependencies:
+@@ -26466,6 +26524,10 @@ packages:
+       json-pointer: 0.6.2
+     dev: false
+ 
++  /openapi-typescript-helpers@0.1.0:
++    resolution: {integrity: sha512-OKTGPthhivLw/fHz6c3OPtg72vi86qaMlqbJuVJ23qOvQ+53uw1n7HdmkJFibloF7QEjDrDkzJiOJuockM/ljw==}
++    dev: false
++
+   /openapi3-ts@4.6.1:
+     resolution: {integrity: sha512-XW9MOldkhoICNeXVzzmXzmOW5G73ppOEGmh7fLCqHjgfdEYCGGN+00MlVCeUZgovjjfC56j9tvtDt1zGabNjjA==}
+     dependencies:
+@@ -26572,6 +26634,13 @@ packages:
+       retry: 0.13.1
+     dev: false
+ 
++  /p-retry@7.1.0:
++    resolution: {integrity: sha512-xL4PiFRQa/f9L9ZvR4/gUCRNus4N8YX80ku8kv9Jqz+ZokkiZLM0bcvX0gm1F3PDi9SPRsww1BDsTWgE6Y1GLQ==}
++    engines: {node: '>=20'}
++    dependencies:
++      is-network-error: 1.3.2
++    dev: false
++
+   /p-retry@8.0.1:
+     resolution: {integrity: sha512-NAigyu8hfvJe7MsS18mnc4is0MZtau3QMdBklaJKK23oBQb6occO3UPM3vHmTckW8KhfyjMZaUOqdTFEYliHgg==}
+     engines: {node: '>=22'}
+@@ -31036,7 +31105,6 @@ packages:
+   /undici@6.29.1:
+     resolution: {integrity: sha512-EvRlUt/QqAEvXdQeRMYUfwOQsfzpDztykrG2owGEE/rBOBoYv9uF39ZzsNDh4lTFHhTr2XOZjKkYgueD12ZmGA==}
+     engines: {node: '>=18.17'}
+-    dev: true
+ 
+   /undici@7.30.1:
+     resolution: {integrity: sha512-03KrMbjIFDWQR5RNPrSw3bd1r12JpyFQl9/yxjUbJtqkjmllqC5lFjZh6ujeuJCKr8EOQvRW872Oy/az+nLYxg==}

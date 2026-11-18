@@ -1,0 +1,148 @@
+{
+    "schema_version":  1,
+    "upstream_repository":  "https://github.com/kortix-ai/CompanyOS.git",
+    "upstream_revision":  "1f58c106d02140c4b050c539904d9410b438ab5f",
+    "docker_sdk_version":  "0.53.0",
+    "bun_version":  "1.4.4",
+    "release_status":  "production-candidate",
+    "patch":  "patches/kortix-docker-cloud.patch",
+    "patch_sha256":  "6c322aa8c3148582411a8578efc73b9c3f980c4a10f7b99f7fd2dc1be8deeb3b",
+    "files":  [
+                  {
+                      "path":  "apps/api/Dockerfile",
+                      "sha256":  "d169d2b82296575f7c05a789ac311b769e48017ff250e79e05871aeca7054092"
+                  },
+                  {
+                      "path":  "apps/api/package.json",
+                      "sha256":  "21486436a128b44fb03103b14274392d68d3525eb007a09fea3b55872f2df872"
+                  },
+                  {
+                      "path":  "apps/api/src/config.ts",
+                      "sha256":  "d6c9838f81de8b0881de412b33a2be2b53d1a816e180c68dad47f60e6f627f2f"
+                  },
+                  {
+                      "path":  "apps/api/src/platform/providers/compute-rates.ts",
+                      "sha256":  "574e7c041b7523975dd1f9ebf22de1c2ce1c0aadec0aa5cdebbe5b79bb17c7ab"
+                  },
+                  {
+                      "path":  "apps/api/src/platform/providers/contract.ts",
+                      "sha256":  "8be5077e5a9fe43b5a5b4c2ece84dd4c40b00766fffdc964bca8ad0d90c6ca3d"
+                  },
+                  {
+                      "path":  "apps/api/src/platform/providers/docker-cloud-client.ts",
+                      "sha256":  "b041fd775f5aea431838bd999272cdd7a8fb778c3590252048d293b196f9f076"
+                  },
+                  {
+                      "path":  "apps/api/src/platform/providers/docker-cloud-ingress.test.ts",
+                      "sha256":  "d8b5427cf98061368236195887b93041ae517858e30a9189ce3c19965749c214"
+                  },
+                  {
+                      "path":  "apps/api/src/platform/providers/docker-cloud-process.ts",
+                      "sha256":  "8a1400b9d53e88f642a206181f7b5163d9d4b5108b39a3c6802541740cf830e5"
+                  },
+                  {
+                      "path":  "apps/api/src/platform/providers/docker-cloud-proxy.ts",
+                      "sha256":  "5a0778ad2a0bb5a589fa2b0c515d61aba97882697b3840a6ce88a3247e542477"
+                  },
+                  {
+                      "path":  "apps/api/src/platform/providers/docker-cloud-transfer.test.ts",
+                      "sha256":  "f816050ce717c48111e032519a79e464619f3e9b40a667391a735e8704cf2e63"
+                  },
+                  {
+                      "path":  "apps/api/src/platform/providers/docker-cloud-transfer.ts",
+                      "sha256":  "7b4a6eec57fb364f4e9745518301c4cb5fc4742b20e1defd17b63791d8f11579"
+                  },
+                  {
+                      "path":  "apps/api/src/platform/providers/docker-cloud.test.ts",
+                      "sha256":  "bba9f720892f6b8fc24df672e798ed0813bd2226e9309a8ff11c34e83fbffbb9"
+                  },
+                  {
+                      "path":  "apps/api/src/platform/providers/docker-cloud.ts",
+                      "sha256":  "fd5760a4c18c419c28304559d9cacfdc55b0ac43b134d9ceb5d7f2075973b86c"
+                  },
+                  {
+                      "path":  "apps/api/src/platform/providers/index.ts",
+                      "sha256":  "fa1ea3110c17888fc597ce17bc7dc66093e9b42fe3a0b27127329fe2a490668a"
+                  },
+                  {
+                      "path":  "apps/api/src/projects/routes/sandboxes.ts",
+                      "sha256":  "d6d830f62eb02f47b5a6ac26d6ac4ad90ecb8ff3a8048386880fb1eb4a6b50df"
+                  },
+                  {
+                      "path":  "apps/api/src/snapshots/provider-coverage.test.ts",
+                      "sha256":  "d8a4346a1f3508ee776057bb996aece9ce570a2b8cfbd86e4be175830d97d059"
+                  },
+                  {
+                      "path":  "apps/api/src/snapshots/provider-coverage.ts",
+                      "sha256":  "18b867b18977f28143e217bf7c2dcb362f3b3cbba985ed3254fb81b23f76a8f6"
+                  },
+                  {
+                      "path":  "apps/api/src/snapshots/providers/docker-cloud-builder.ts",
+                      "sha256":  "29947e1aca9a321e677beaaa677126c1635042e3dc87df7918b8c51241fd72ae"
+                  },
+                  {
+                      "path":  "apps/api/src/snapshots/providers/docker-cloud.ts",
+                      "sha256":  "666e3cd08ae60e1d497699b125ea40147e0d1c5091ab3dd95086e39ed8b9402b"
+                  },
+                  {
+                      "path":  "apps/api/src/snapshots/providers/index.ts",
+                      "sha256":  "caea5f925c2e021e3f42db6185fbec1284bc8f34c81d601fba2c0392d94c380e"
+                  },
+                  {
+                      "path":  "apps/cli/src/commands/self-host.ts",
+                      "sha256":  "678768748aa476e719ad62c54d034d0d3f8ae5a6758c64ad3ff3eeacf30fcbcf"
+                  },
+                  {
+                      "path":  "apps/cli/src/self-host/secrets-registry.ts",
+                      "sha256":  "ea4e108c17319aaa2d9380e376e9b63bfbc6b34430d8bafa3d523e29b3ef9d25"
+                  },
+                  {
+                      "path":  "apps/cli/src/self-host/shared-runtime-defaults.ts",
+                      "sha256":  "17da3866cee6d5e3194b7367c43d8cb03624e28e9c3d6b0906ec9fd883963239"
+                  },
+                  {
+                      "path":  "packages/api-contract/src/index.ts",
+                      "sha256":  "cf3bed7953ad90c02a8de1397d8da91599c6f7e0a84626ef30ede8a5f04f227c"
+                  },
+                  {
+                      "path":  "packages/db/migrations/20261117221000000_sandbox_provider_add_docker_cloud.sql",
+                      "sha256":  "aae9f09e37336cd9858f770f54c892795995eeff8a4b492640ec600cf7e1730f"
+                  },
+                  {
+                      "path":  "packages/db/src/schema/kortix.test.ts",
+                      "sha256":  "d5fce2aaed67ba9f62e72ccd967472ec8d5e169c2bb7107efc2c66b8a646be5a"
+                  },
+                  {
+                      "path":  "packages/db/src/schema/kortix.ts",
+                      "sha256":  "e459fe7b0642b7f2e4e0a134dbccc544b2548398e19211b64b39840230563b9f"
+                  },
+                  {
+                      "path":  "packages/sdk/src/core/rest/platform-client/types.ts",
+                      "sha256":  "5a6ab6f249faa752f284bcf3019b6e2774e8d74f544703e86ff9c9a2d93854ba"
+                  },
+                  {
+                      "path":  "packages/sdk/src/core/rest/projects-client/sandbox.ts",
+                      "sha256":  "12f4cd1ac939a0082cd0b562e24d926a321d768b39ff1871080a76de4dc2653b"
+                  },
+                  {
+                      "path":  "packages/sdk/src/core/rest/projects-client/session-sandbox.ts",
+                      "sha256":  "714b9008f2bb836ec4e3d389459e9ffb63afc36b1efedfcc0a94951e1f7e2ae3"
+                  },
+                  {
+                      "path":  "packages/sdk/src/core/rest/projects-client/sessions.ts",
+                      "sha256":  "d2d70cf434a38dd6bf6be7dcd5d2b1cc8328627af2b1ea5fd922262151cd7380"
+                  },
+                  {
+                      "path":  "packages/ui/src/internal/lib/sandbox-providers.ts",
+                      "sha256":  "e06c1ebd6929574117b9a162e30b835ea230ff59543d43410da9e5467b4fad21"
+                  },
+                  {
+                      "path":  "pnpm-lock.yaml",
+                      "sha256":  "13aabe3713e350d6f26409b113de044ad107f845094bddee976f5f00055111b7"
+                  },
+                  {
+                      "path":  "apps/api/src/platform/providers/docker-cloud-image-ownership.test.ts",
+                      "sha256":  "e57dada98454bccd2f08adfa4e3ecb5b3e38fd1ca71c3098984fa8918c59bc44"
+                  }
+              ]
+}

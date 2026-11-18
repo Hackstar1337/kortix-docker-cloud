@@ -1,0 +1,9 @@
+# Dockerfile-specific ignore list: upstream excludes *.test.ts from production
+# contexts, but this isolated test image must include them.
+.git
+.work
+node_modules
+**/node_modules
+**/__pycache__
+.env
+*.env

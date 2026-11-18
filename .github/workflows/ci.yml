@@ -1,0 +1,35 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  kit-tests:
+    name: Integrity and installer tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: python3 scripts/verify.py
+      - run: python3 -m unittest discover -s tests -v
+      - run: bash -n scripts/build.sh scripts/test-contract.sh
+  provider-contract:
+    name: Pinned patch and provider contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: python3 scripts/prepare.py --target .work/upstream
+      - run: bash scripts/test-contract.sh .work/upstream
+# CI never receives Docker Cloud or application credentials, creates paid cloud
+# resources, deploys the API, or publishes container images.
