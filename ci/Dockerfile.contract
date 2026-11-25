@@ -1,4 +1,4 @@
-FROM oven/bun:1.4.4
+FROM oven/bun:1.4.5
 USER root
 WORKDIR /opt/test-dependencies
 RUN bun add --exact @docker/sandboxes@0.53.0 ws@8.21.0
